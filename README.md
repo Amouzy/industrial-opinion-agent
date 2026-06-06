@@ -12,10 +12,10 @@
 
 ## 交付文档
 
-- [PRD 文档](docs/PRD_产业舆情Agent.md)
-- [工作流编排示意图](docs/WORKFLOW_ARCHITECTURE.md)
-- [标签体系设计说明](docs/TAG_TAXONOMY.md)
-- [架构与实现说明](docs/ARCHITECTURE.md)
+- [PRD 文档](docs/desc/PRD_产业舆情Agent.pdf)
+- [工作流编排示意图](docs/desc/工作流编排说明.pdf)
+- [标签体系设计说明](docs/desc/标签设计说明.pdf)
+- [架构与实现说明](docs/desc/项目实施说明.pdf)
 
 ## 本地启动
 
@@ -114,9 +114,9 @@ docker compose up --build
 - `backend/app/services`: 采集标准化、分类、去重、排序、事实提炼、简报、工作流。
 - `backend/app/api.py`: 工作台 API。
 - `frontend/src/App.vue`: Vue3 单页工作台。
-- `docs/ARCHITECTURE.md`: 架构与数据来源说明。
-- `docs/PRD_产业舆情Agent.md`: PRD 交付文档。
-- `docs/WORKFLOW_ARCHITECTURE.md`: 工作流编排示意图。
-- `docs/TAG_TAXONOMY.md`: 标签体系设计说明。
+- `docs/desc/项目实施说明.pdf`: 实施说明。
+- `docs/desc/PRD_产业舆情Agent.pdf`: PRD 交付文档。
+- `docs/desc/工作流编排说明.pdf`: 工作流编排示意图。
+- `docs/desc/标签设计说明.pdf`: 标签体系设计说明。
 - `docs/superpowers/plans`: 实现计划。
 - `docs/ui-design`: UI 设计稿副本。
