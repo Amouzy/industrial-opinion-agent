@@ -1,0 +1,24 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_PATH: /app/data/opinion_agent.sqlite3
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+      SEED_ON_START: "1"
+      SCHEDULER_ENABLED: "1"
+      APP_TIMEZONE: Asia/Shanghai
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      VITE_API_BASE: http://localhost:8000
+    ports:
+      - "5173:5173"
+    depends_on:
+      - backend
