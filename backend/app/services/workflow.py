@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
+from threading import Thread
 from typing import Any, Callable
 
 from app.config import get_settings
@@ -116,35 +117,98 @@ def run_source_interval_scan(
     force_all: bool = False,
 ) -> dict[str, Any]:
     current = now or datetime.now(timezone.utc)
-    checked_at = current.isoformat()
     running = db.query_one("SELECT id, trigger_type, started_at FROM workflow_runs WHERE status = 'running' ORDER BY started_at DESC LIMIT 1")
     if running:
-        reason = f"Workflow already running: #{running['id']} {running['trigger_type']} started_at={running['started_at']}"
-        run_id = db.execute(
-            """
-            INSERT INTO workflow_runs (trigger_type, started_at, ended_at, status, error_summary, node_trace_json)
-            VALUES (?, ?, ?, 'skipped', ?, ?)
-            """,
-            (
-                trigger_type,
-                utc_now_iso(),
-                utc_now_iso(),
-                reason,
-                to_json([_trace_node("collect", {"trigger_type": trigger_type}, {"skipped": True, "reason": reason})]),
-            ),
-        )
-        return db.query_one("SELECT * FROM workflow_runs WHERE id = ?", (run_id,)) or {}
-    target_sources = (
-        db.query("SELECT * FROM sources WHERE enabled = 1 ORDER BY reliability_score DESC, id")
-        if force_all
-        else due_sources(db, current)
+        return _insert_skipped_run(db, trigger_type, running)
+    run_id = _insert_running_run(db, trigger_type)
+    from app.services.workflow_graph import run_source_interval_graph
+
+    return run_source_interval_graph(db, run_id, trigger_type, current, fetcher, force_all)
+
+
+def start_source_interval_scan_background(
+    db: Database,
+    trigger_type: str = "manual_collect",
+    now: datetime | None = None,
+    fetcher: SourceFetcher = fetch_source_items,
+    force_all: bool = False,
+) -> dict[str, Any]:
+    current = now or datetime.now(timezone.utc)
+    running = db.query_one("SELECT id, trigger_type, started_at FROM workflow_runs WHERE status = 'running' ORDER BY started_at DESC LIMIT 1")
+    if running:
+        return _insert_skipped_run(db, trigger_type, running)
+    run_id = _insert_running_run(db, trigger_type)
+    row = db.query_one("SELECT * FROM workflow_runs WHERE id = ?", (run_id,)) or {}
+    from app.services.workflow_graph import build_source_interval_graph
+
+    build_source_interval_graph()
+    worker = Thread(
+        target=_execute_source_interval_scan_safely,
+        args=(db, run_id, trigger_type, current, fetcher, force_all),
+        daemon=True,
     )
-    run_id = db.execute(
+    worker.start()
+    return row
+
+
+def _insert_running_run(db: Database, trigger_type: str) -> int:
+    return db.execute(
         """
         INSERT INTO workflow_runs (trigger_type, started_at, status, node_trace_json)
         VALUES (?, ?, 'running', ?)
         """,
         (trigger_type, utc_now_iso(), to_json([])),
+    )
+
+
+def _insert_skipped_run(db: Database, trigger_type: str, running: dict[str, Any]) -> dict[str, Any]:
+    reason = f"Workflow already running: #{running['id']} {running['trigger_type']} started_at={running['started_at']}"
+    run_id = db.execute(
+        """
+        INSERT INTO workflow_runs (trigger_type, started_at, ended_at, status, error_summary, node_trace_json)
+        VALUES (?, ?, ?, 'skipped', ?, ?)
+        """,
+        (
+            trigger_type,
+            utc_now_iso(),
+            utc_now_iso(),
+            reason,
+            to_json([_trace_node("collect", {"trigger_type": trigger_type}, {"skipped": True, "reason": reason})]),
+        ),
+    )
+    return db.query_one("SELECT * FROM workflow_runs WHERE id = ?", (run_id,)) or {}
+
+
+def _execute_source_interval_scan_safely(
+    db: Database,
+    run_id: int,
+    trigger_type: str,
+    current: datetime,
+    fetcher: SourceFetcher,
+    force_all: bool,
+) -> None:
+    try:
+        from app.services.workflow_graph import run_source_interval_graph
+
+        run_source_interval_graph(db, run_id, trigger_type, current, fetcher, force_all)
+    except Exception:
+        pass
+
+
+def _execute_source_interval_scan(
+    db: Database,
+    run_id: int,
+    trigger_type: str,
+    current: datetime,
+    fetcher: SourceFetcher,
+    force_all: bool,
+    orchestrator: str = "python-sequential",
+) -> dict[str, Any]:
+    checked_at = current.isoformat()
+    target_sources = (
+        db.query("SELECT * FROM sources WHERE enabled = 1 ORDER BY reliability_score DESC, id")
+        if force_all
+        else due_sources(db, current)
     )
     trace: list[dict[str, Any]] = []
     raw_candidates: list[dict[str, Any]] = []
@@ -210,6 +274,7 @@ def run_source_interval_scan(
                 "collect",
                 {
                     "trigger_type": trigger_type,
+                    "orchestrator": orchestrator,
                     "force_all": force_all,
                     "enabled_source_count": enabled_count,
                     "target_source_count": len(target_sources),
@@ -217,6 +282,7 @@ def run_source_interval_scan(
                     "source_windows": source_windows,
                 },
                 {
+                    "orchestrator": orchestrator,
                     "candidate_count": len(raw_candidates),
                     "source_results": source_results,
                     "candidates": _sample_candidates(raw_candidates),
@@ -305,7 +371,8 @@ def _process_candidates(
     trace: list[dict[str, Any]],
     failed_count: int,
     llm_client: LLMClient | None = None,
-) -> None:
+    finalize_run: bool = True,
+) -> dict[str, Any]:
     sources = {row["id"]: row for row in db.query("SELECT * FROM sources WHERE enabled = 1")}
     raw_item_ids: list[int] = []
     raw_item_summaries: list[dict[str, Any]] = []
@@ -547,15 +614,34 @@ def _process_candidates(
                 {"brief_id": brief.get("id"), "title": brief.get("title")},
             )
         )
-    db.execute(
-        """
-        UPDATE workflow_runs
-        SET ended_at = ?, status = 'success', collected_count = ?, deduped_count = ?,
-            classified_count = ?, extracted_count = ?, failed_count = ?, node_trace_json = ?
-        WHERE id = ?
-        """,
-        (utc_now_iso(), len(raw_item_ids), len(clusters), processed_count, processed_count, failed_count, to_json(trace), run_id),
-    )
+    completion = {
+        "collected_count": len(raw_item_ids),
+        "deduped_count": len(clusters),
+        "classified_count": processed_count,
+        "extracted_count": processed_count,
+        "failed_count": failed_count,
+        "trace": trace,
+    }
+    if finalize_run:
+        db.execute(
+            """
+            UPDATE workflow_runs
+            SET ended_at = ?, status = 'success', collected_count = ?, deduped_count = ?,
+                classified_count = ?, extracted_count = ?, failed_count = ?, node_trace_json = ?
+            WHERE id = ?
+            """,
+            (
+                utc_now_iso(),
+                completion["collected_count"],
+                completion["deduped_count"],
+                completion["classified_count"],
+                completion["extracted_count"],
+                completion["failed_count"],
+                to_json(trace),
+                run_id,
+            ),
+        )
+    return completion
 
 
 def _screen_relevant_candidates(

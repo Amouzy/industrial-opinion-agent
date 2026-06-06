@@ -20,7 +20,7 @@ from app.services.taxonomy import (
     SOURCE_TYPE_LABELS,
     SUBJECT_ROLE_ORDER,
 )
-from app.services.workflow import run_source_interval_scan
+from app.services.workflow import start_source_interval_scan_background
 
 
 def create_router(db: Database) -> APIRouter:
@@ -155,7 +155,7 @@ def create_router(db: Database) -> APIRouter:
 
     @router.post("/collect/manual")
     def manual_collect() -> dict[str, Any]:
-        row = run_source_interval_scan(db, trigger_type="manual_collect", force_all=True)
+        row = start_source_interval_scan_background(db, trigger_type="manual_collect", force_all=True)
         return {**row, "node_trace": from_json(row.get("node_trace_json"), [])}
 
     @router.get("/sources")

@@ -15,6 +15,7 @@ from app.services.taxonomy import (
     KEY_ACTORS,
     SIGNAL_ATTRIBUTE_ORDER,
     SIGNAL_ATTRIBUTES,
+    SOURCE_TYPE_LABELS,
     SUBJECT_ROLE_ORDER,
     SUBJECT_ROLES,
 )
@@ -145,22 +146,40 @@ def _classify_with_rules(item: dict[str, Any], text: str, source_type: str, indu
     }
 
 
-def _classify_with_llm(item: dict[str, Any], industry: str, llm_client: LLMClient) -> dict[str, Any] | None:
+def _classify_with_llm(
+    item: dict[str, Any],
+    industry: str,
+    llm_client: LLMClient,
+) -> dict[str, Any] | None:
     try:
         return llm_client.complete_json(
             system_prompt=(
-                "你是产业舆情 Agent 的分类打标节点。必须只输出 JSON，且所有标签只能从给定枚举中选择。"
-                "不要输出最终排序总分。"
+                "你是产业舆情 Agent 的 classify_item 分类打标节点。"
+                "任务是基于标题、正文、来源元数据和 taxonomy_definitions 选择结构化标签。"
+                "必须只输出 JSON；所有标签只能从给定枚举中选择，不能新增、改写或翻译标签。"
+                "每个分类判断必须有标题、正文或来源属性中的证据支撑；不要编造主体、事件、标签或时间。"
+                "不确定时保守选择更少标签和较低置信度。不要输出最终排序总分。"
             ),
             user_payload={
                 "title": item.get("title"),
                 "content": item.get("raw_content") or item.get("content_excerpt"),
+                "content_excerpt": item.get("content_excerpt"),
+                "source_name": item.get("source_name"),
+                "source_type": item.get("source_type"),
+                "source_type_label": SOURCE_TYPE_LABELS.get(str(item.get("source_type") or ""), ""),
+                "url": item.get("url"),
+                "published_at": item.get("published_at"),
+                "fetched_at": item.get("fetched_at"),
                 "industry": industry,
                 "allowed_industry_subtags": INDUSTRY_SUBTAGS[industry],
                 "allowed_event_types": EVENT_TYPE_ORDER,
                 "allowed_importance_levels": IMPORTANCE_LEVEL_ORDER,
                 "allowed_subject_roles": SUBJECT_ROLE_ORDER,
                 "allowed_signal_attributes": SIGNAL_ATTRIBUTE_ORDER,
+                "allowed_key_actor_levels": list(_key_actor_level_definitions()),
+                "taxonomy_definitions": _taxonomy_definitions(industry),
+                "decision_rules": _classification_decision_rules(),
+                "output_requirements": _classification_output_requirements(),
                 "required_json_fields": [
                     "industry_subtags",
                     "event_types",
@@ -176,6 +195,166 @@ def _classify_with_llm(item: dict[str, Any], industry: str, llm_client: LLMClien
         )
     except Exception:
         return None
+
+
+def _taxonomy_definitions(industry: str) -> dict[str, Any]:
+    return {
+        "industry": {
+            "selected": industry,
+            "definition": "候选内容已经通过相关性节点进入该产业；分类节点只需在该产业内细分打标。",
+        },
+        "industry_subtags": {
+            industry: {label: _industry_subtag_definitions(industry).get(label, "") for label in INDUSTRY_SUBTAGS[industry]}
+        },
+        "event_types": {label: _event_type_definitions().get(label, "") for label in EVENT_TYPE_ORDER},
+        "importance_levels": _importance_level_definitions(),
+        "subject_roles": {label: _subject_role_definitions().get(label, "") for label in SUBJECT_ROLE_ORDER},
+        "signal_attributes": {label: _signal_attribute_definitions().get(label, "") for label in SIGNAL_ATTRIBUTE_ORDER},
+        "key_actor_level": _key_actor_level_definitions(),
+        "entities": {
+            "text": "正文中实际出现的机构、公司、产品、人物或地点名称。",
+            "type": "company、agency、institution、product、person、location、other 之一；不确定用 other。",
+            "confidence": "0 到 1。只有正文中能定位或高度确定的实体才输出。",
+        },
+    }
+
+
+def _classification_decision_rules() -> list[str]:
+    return [
+        "只依据 title、content、content_excerpt 和 source metadata 判断，不使用外部知识补全事实。",
+        "industry_subtags 选择 1-3 个最具体细分；必须与正文里的产品、技术、环节或业务场景直接相关。",
+        "event_types 选择 1-3 个主要事件类型；若只是背景提及，不要打成事件类型。",
+        "subject_roles 选择实际参与事件的主体角色，而不是文章受众或泛泛提到的生态角色。",
+        "signal_attributes 描述该事件对产业跟踪的信号含义；机会、风险、政策、竞争、技术、商业化、区域、资本只能在有证据时选择。",
+        "importance_level 评估事件本身的产业影响，不输出排序总分；政策监管、重大风险、核心主体和格局变化通常更高。",
+        "key_actor_level 根据正文实际出现的主体选择 core、important、normal、none；不要把未出现主体算入。",
+        "entities 只输出正文或标题中实际出现的实体，不能编造别名、上下游公司或监管机构。",
+        "confidence 表示分类可靠性：0.90 以上需事实清楚且标签直接命中；0.70-0.89 表示较可靠；0.50-0.69 表示证据有限；低于 0.50 表示不确定。",
+        "当正文信息不足时，使用更少标签并降低 confidence，不要用猜测补齐字段。",
+    ]
+
+
+def _classification_output_requirements() -> dict[str, Any]:
+    return {
+        "format": "只返回单个 JSON object，不要 Markdown、解释文字或排序分数。",
+        "required_fields": [
+            "industry_subtags",
+            "event_types",
+            "importance_level",
+            "importance_reason",
+            "subject_roles",
+            "signal_attributes",
+            "confidence",
+            "entities",
+            "key_actor_level",
+        ],
+        "enum_only_fields": [
+            "industry_subtags",
+            "event_types",
+            "importance_level",
+            "subject_roles",
+            "signal_attributes",
+            "key_actor_level",
+        ],
+        "max_counts": {
+            "industry_subtags": 3,
+            "event_types": 3,
+            "subject_roles": 3,
+            "signal_attributes": 3,
+            "entities": 8,
+        },
+        "evidence": (
+            "importance_reason 必须用一句话说明来自标题、正文或来源类型的关键证据；"
+            "不得用没有在输入中出现的事实作为依据。"
+        ),
+        "fallback_policy": "证据不足时保守选择较少标签，并降低 confidence。",
+    }
+
+
+def _industry_subtag_definitions(industry: str) -> dict[str, str]:
+    definitions = {
+        "新能源汽车": {
+            "整车制造": "整车品牌、车型、销量、交付、制造和整车平台相关事件。",
+            "动力电池": "电芯、电池包、储能电池、动力电池材料体系和电池企业相关事件。",
+            "智能驾驶": "自动驾驶、辅助驾驶、车端感知、智驾算法和驾驶系统相关事件。",
+            "充换电基础设施": "充电桩、换电站、补能网络、运营平台和基础设施政策相关事件。",
+            "汽车芯片": "车规芯片、座舱芯片、智驾芯片、功率半导体和供应相关事件。",
+            "车载软件": "座舱系统、车机、OTA、车载操作系统和软件服务相关事件。",
+            "上游材料": "锂、镍、钴、正负极材料、电解液、隔膜等上游材料相关事件。",
+            "出口与海外市场": "出口、海外建厂、海外销售、海外监管和国际市场拓展相关事件。",
+        },
+        "人工智能": {
+            "基础模型": "大模型、基础模型、多模态模型、模型训练、模型服务和 API 能力相关事件。",
+            "AI 芯片": "GPU、AI 加速器、训练/推理芯片、芯片供应和算力硬件相关事件。",
+            "算力基础设施": "数据中心、算力集群、云算力、训练基础设施和算力调度相关事件。",
+            "AI 应用": "面向具体行业或用户场景的 AI 产品、应用落地和解决方案相关事件。",
+            "智能体/Agent": "Agent、自动化工作流、工具调用、多智能体协作和智能体平台相关事件。",
+            "数据与安全": "数据治理、隐私、安全、内容安全、合规和模型安全相关事件。",
+            "机器人": "机器人、具身智能、人形机器人和物理 AI 相关事件。",
+            "企业服务": "企业级 SaaS、B 端平台、企业客户服务、API 商业化和工作流集成相关事件。",
+        },
+    }
+    return definitions.get(industry, {})
+
+
+def _event_type_definitions() -> dict[str, str]:
+    return {
+        "政策/监管": "政府、监管机构、行业主管部门发布政策、规则、通知、处罚、监管口径或合规要求。",
+        "融资/投资": "融资、投资、基金、股权投资、战略投资或资本注入事件。",
+        "并购/重组": "收购、合并、资产重组、控制权变更或业务整合事件。",
+        "产品发布": "新产品、新服务、新版本、新平台上线或发布。",
+        "技术突破": "明确技术创新、性能突破、研发成果、专利或关键能力升级。",
+        "战略合作": "签约、合作、联盟、联合研发、生态伙伴或客户合作。",
+        "产能/交付": "产能扩张、量产、交付、订单履约、工厂投产或产线变化。",
+        "价格/商业化": "价格调整、商业模式、收费、订阅、商业化进展或收入化。",
+        "龙头企业动向": "核心企业、头部公司、关键监管机构或行业风向标主体的重要动作。",
+        "供应链变化": "供应短缺、断供、供应商切换、上游材料和核心部件供需变化。",
+        "海外扩张": "出口、海外市场、海外建厂、国际合作或跨境监管事件。",
+        "风险/负面舆情": "事故、召回、处罚、诉讼、安全问题、经营风险或明显负面舆情。",
+    }
+
+
+def _importance_level_definitions() -> dict[str, str]:
+    return {
+        "high": "对产业格局、监管环境、核心主体、供应链、风险暴露或技术路线可能产生显著影响。",
+        "medium": "有明确事实和跟踪价值，但影响范围、持续性或产业传导仍需后续验证。",
+        "low": "事实较弱、影响较局部、重复性较高，或只有一般资讯价值。",
+    }
+
+
+def _subject_role_definitions() -> dict[str, str]:
+    return {
+        "整车厂/模型厂商": "新能源汽车整车企业，或 AI 基础模型、模型服务、平台型模型厂商。",
+        "核心零部件/芯片企业": "汽车核心零部件、车规芯片、AI 芯片、GPU 和关键硬件供应商。",
+        "电池/算力基础设施企业": "动力电池、储能、电池材料、数据中心、云算力和算力基础设施企业。",
+        "政府/监管机构": "政府部门、监管机构、行业主管部门和公共政策制定或执法主体。",
+        "高校/科研机构": "大学、实验室、研究院、科研团队和产学研机构。",
+        "投资机构": "基金、VC/PE、产业资本、金融机构和投资主体。",
+        "海外企业": "境外企业、跨国公司或主要事件发生在海外市场的企业主体。",
+        "下游客户/应用方": "采购方、行业客户、场景方、渠道方和实际应用落地主体。",
+    }
+
+
+def _signal_attribute_definitions() -> dict[str, str]:
+    return {
+        "机会信号": "可能带来市场扩张、需求增长、产业链机会或新业务窗口。",
+        "风险信号": "可能带来合规、安全、经营、供应或声誉风险。",
+        "政策信号": "反映政策导向、监管尺度、补贴规则、准入标准或政府重点。",
+        "竞争格局变化": "可能改变头部企业地位、市场份额、竞争边界或上下游议价关系。",
+        "技术路线变化": "体现技术范式、架构、材料、算法、路线或关键性能方向变化。",
+        "商业化进展": "体现产品落地、付费、客户转化、收入化、规模部署或商业模式成熟。",
+        "区域产业变化": "体现地方产业集群、区域政策、园区、海外或地区市场变化。",
+        "资本市场信号": "体现融资、并购、估值、上市、股价敏感信息或资本偏好变化。",
+    }
+
+
+def _key_actor_level_definitions() -> dict[str, str]:
+    return {
+        "core": "taxonomy.KEY_ACTORS 中的核心企业或监管主体，或文本中明确具有行业风向标地位的主体。",
+        "important": "非核心名单内，但对该细分产业有明显影响力的主体。",
+        "normal": "普通参与方、客户、供应商或区域性企业。",
+        "none": "未出现可识别关键主体，或主体与产业事件关系不明确。",
+    }
 
 
 def _apply_structured_override(

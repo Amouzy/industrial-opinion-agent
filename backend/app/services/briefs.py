@@ -9,7 +9,7 @@ from app.database import Database, from_json, to_json
 def generate_brief(db: Database, brief_type: str = "manual", item_limit: int = 8) -> dict[str, Any]:
     items = db.query(
         """
-        SELECT p.*, r.title, r.url, r.published_at, s.name AS source_name
+        SELECT p.*, r.title, r.url, r.published_at, r.fetched_at, s.name AS source_name
         FROM processed_items p
         JOIN raw_items r ON r.id = p.raw_item_id
         JOIN sources s ON s.id = r.source_id
@@ -19,8 +19,9 @@ def generate_brief(db: Database, brief_type: str = "manual", item_limit: int = 8
         (item_limit,),
     )
     now = datetime.now(timezone.utc).isoformat()
-    start = items[-1]["published_at"] if items else now
-    end = items[0]["published_at"] if items else now
+    item_times = [_brief_item_time(item, now) for item in items]
+    start = min(item_times) if item_times else now
+    end = max(item_times) if item_times else now
     lines = [f"# 产业舆情{'晨报' if brief_type == 'morning' else '简报'}", ""]
     if not items:
         lines.append("当前筛选范围内暂无可生成简报的情报。")
@@ -45,3 +46,7 @@ def generate_brief(db: Database, brief_type: str = "manual", item_limit: int = 8
         (brief_type, start, end, title, "\n".join(lines), to_json([item["id"] for item in items]), now),
     )
     return db.query_one("SELECT * FROM briefs WHERE id = ?", (brief_id,)) or {}
+
+
+def _brief_item_time(item: dict[str, Any], fallback: str) -> str:
+    return str(item.get("published_at") or item.get("fetched_at") or item.get("created_at") or fallback)

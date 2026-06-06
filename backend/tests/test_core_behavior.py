@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import math
 import tempfile
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -23,7 +24,14 @@ from app.database import Database, from_json
 from app.seed_data import demo_raw_items
 from app.scheduler import start_scheduler
 from app.services.classifier import ClassificationError, classify_item
-from app.services.collector import _decode_bytes, clean_article_text, extract_source_items, normalize_raw_item
+from app.services.collector import (
+    FetchedDocument,
+    _decode_bytes,
+    clean_article_text,
+    extract_source_items,
+    fetch_source_items,
+    normalize_raw_item,
+)
 from app.services.dedup import choose_representative_item
 from app.services.ranking import RankInput, calculate_rank_score
 from app.services.taxonomy import EVENT_TYPES, INDUSTRIES, INDUSTRY_SUBTAGS, SIGNAL_ATTRIBUTES
@@ -70,14 +78,18 @@ class ClassificationContractTest(unittest.TestCase):
                     "key_actor_level": "core",
                 }
 
+        fake_client = FakeLLMClient()
         result = classify_item(
             {
                 "title": "OpenAI 发布新一代企业级模型服务",
                 "raw_content": "OpenAI 面向企业客户发布新一代模型服务，强化 API、智能体和数据安全能力。",
+                "source_name": "OpenAI Blog",
                 "source_type": "company",
+                "published_at": "2026-06-05T09:00:00+00:00",
+                "fetched_at": "2026-06-05T09:05:00+00:00",
                 "relevance_industry": "人工智能",
             },
-            llm_client=FakeLLMClient(),
+            llm_client=fake_client,
         )
 
         self.assertEqual(result.industry, "人工智能")
@@ -86,6 +98,25 @@ class ClassificationContractTest(unittest.TestCase):
         self.assertEqual(result.importance_level, "medium")
         self.assertEqual(result.llm_provider, "openai")
         self.assertEqual(result.llm_model, "test-classifier-model")
+        self.assertIn("taxonomy_definitions", fake_client.user_payload)
+        self.assertIn("decision_rules", fake_client.user_payload)
+        self.assertIn("output_requirements", fake_client.user_payload)
+        self.assertNotIn("rule_baseline", fake_client.user_payload)
+        self.assertEqual(fake_client.user_payload["source_name"], "OpenAI Blog")
+        self.assertEqual(fake_client.user_payload["source_type"], "company")
+        self.assertEqual(fake_client.user_payload["published_at"], "2026-06-05T09:00:00+00:00")
+        self.assertEqual(fake_client.user_payload["fetched_at"], "2026-06-05T09:05:00+00:00")
+        self.assertIn("基础模型", fake_client.user_payload["taxonomy_definitions"]["industry_subtags"]["人工智能"])
+        self.assertIn("产品发布", fake_client.user_payload["taxonomy_definitions"]["event_types"])
+        self.assertIn("evidence", fake_client.user_payload["output_requirements"])
+        self.assertIn("key_actor_level", fake_client.user_payload["taxonomy_definitions"])
+        prompt_contract = str(fake_client.system_prompt) + " " + " ".join(fake_client.user_payload["decision_rules"])
+        self.assertNotIn("rule_baseline", prompt_contract)
+        self.assertNotIn("规则基线", prompt_contract)
+        self.assertNotIn("本地规则", prompt_contract)
+        self.assertIn("证据", fake_client.system_prompt)
+        self.assertIn("不要编造", fake_client.system_prompt)
+        self.assertIn("排序总分", fake_client.system_prompt)
 
     def test_classification_falls_back_when_llm_returns_out_of_scope_labels(self) -> None:
         class FakeSettings:
@@ -194,6 +225,61 @@ class RankingFormulaTest(unittest.TestCase):
 
 
 class RelevanceScreenContractTest(unittest.TestCase):
+    def test_relevance_llm_receives_professional_screening_contract(self) -> None:
+        from app.services.relevance import screen_relevance
+
+        class FakeSettings:
+            provider = "openai"
+            model = "test-relevance-model"
+
+        class FakeLLMClient:
+            settings = FakeSettings()
+            is_configured = True
+
+            def complete_json(self, system_prompt: str, user_payload: dict[str, object]) -> dict[str, object]:
+                self.system_prompt = system_prompt
+                self.user_payload = user_payload
+                return {
+                    "is_relevant": True,
+                    "industry": "人工智能",
+                    "reason": "正文明确描述企业级模型服务发布，属于人工智能产业情报。",
+                    "confidence": 0.88,
+                    "matched_terms": ["模型服务", "人工智能"],
+                }
+
+        fake_client = FakeLLMClient()
+        result = screen_relevance(
+            {
+                "title": "OpenAI 发布新一代企业级模型服务",
+                "raw_content": "OpenAI 面向企业客户发布新一代模型服务，强化 API、智能体和数据安全能力。",
+                "content_excerpt": "OpenAI 发布企业级模型服务。",
+                "source_name": "OpenAI Blog",
+                "source_type": "company",
+                "url": "https://example.com/openai/model-service",
+                "published_at": "2026-06-05T09:00:00+00:00",
+                "fetched_at": "2026-06-05T09:05:00+00:00",
+                "industry_hint": "ai",
+            },
+            llm_client=fake_client,
+        )
+
+        self.assertTrue(result.is_relevant)
+        self.assertEqual(result.provider, "openai")
+        self.assertIn("industry_definitions", fake_client.user_payload)
+        self.assertIn("exclusion_rules", fake_client.user_payload)
+        self.assertIn("decision_rules", fake_client.user_payload)
+        self.assertIn("confidence_calibration", fake_client.user_payload)
+        self.assertIn("output_requirements", fake_client.user_payload)
+        self.assertEqual(fake_client.user_payload["source_name"], "OpenAI Blog")
+        self.assertEqual(fake_client.user_payload["published_at"], "2026-06-05T09:00:00+00:00")
+        self.assertIn("人工智能", fake_client.user_payload["industry_definitions"])
+        self.assertIn("内部会议", " ".join(fake_client.user_payload["exclusion_rules"]))
+        self.assertIn("industry_hint", " ".join(fake_client.user_payload["decision_rules"]))
+        self.assertNotIn("local_rule_result", fake_client.user_payload)
+        self.assertIn("证据", fake_client.system_prompt)
+        self.assertIn("不要编造", fake_client.system_prompt)
+        self.assertIn("只判断是否进入", fake_client.system_prompt)
+
     def test_rejects_fake_degree_fraud_even_when_source_hint_is_nev(self) -> None:
         from app.services.relevance import screen_relevance
 
@@ -506,6 +592,26 @@ class LLMConfigContractTest(unittest.TestCase):
 
 
 class RawItemNormalizationTest(unittest.TestCase):
+    def test_fetch_source_items_returns_empty_when_no_article_candidates_are_discovered(self) -> None:
+        def fake_fetch_url(url: str, timeout: int = 8) -> FetchedDocument:
+            return FetchedDocument(
+                url=url,
+                text="<html><head><title>News List</title></head><body><nav>Home</nav><p>No recent items.</p></body></html>",
+                content_type="text/html; charset=utf-8",
+            )
+
+        with patch("app.services.collector.fetch_url", fake_fetch_url):
+            items = fetch_source_items(
+                {
+                    "id": 1,
+                    "url": "https://example.com/news",
+                    "type": "media",
+                    "industry_hint": "artificial_intelligence",
+                }
+            )
+
+        self.assertEqual(items, [])
+
     def test_raw_item_preserves_full_article_and_derives_excerpt(self) -> None:
         content = "第一段说明政策背景。" * 40 + "最后一段包含产业影响。"
         item = normalize_raw_item(
@@ -1216,6 +1322,18 @@ class RawItemNormalizationTest(unittest.TestCase):
         self.assertIsNone(result.fallback_reason)
         self.assertIn("source_name", fake_client.user_payload)
         self.assertEqual(fake_client.user_payload["classification"]["event_types"], ["产品发布"])
+        self.assertIn("input_contract", fake_client.user_payload)
+        self.assertIn("summary_requirements", fake_client.user_payload)
+        self.assertIn("key_facts_schema", fake_client.user_payload)
+        self.assertIn("impact_analysis_rules", fake_client.user_payload)
+        self.assertIn("source_span_requirements", fake_client.user_payload)
+        self.assertIn("output_requirements", fake_client.user_payload)
+        self.assertIn("who", fake_client.user_payload["key_facts_schema"])
+        self.assertIn("impact", fake_client.user_payload["key_facts_schema"])
+        self.assertIn("raw_content", fake_client.user_payload["source_span_requirements"]["allowed_fields"])
+        self.assertIn("证据", fake_client.system_prompt)
+        self.assertIn("不要编造", fake_client.system_prompt)
+        self.assertIn("产业影响", fake_client.system_prompt)
 
     def test_bounded_llm_content_caps_long_readable_text(self) -> None:
         from app.services.extractor import _bounded_llm_content
@@ -1587,6 +1705,48 @@ class RepresentativeSelectionTest(unittest.TestCase):
         self.assertEqual(len(items), 2)
 
 
+class BriefGenerationContractTest(unittest.TestCase):
+    def test_generate_brief_uses_fetched_at_when_published_at_is_missing(self) -> None:
+        from app.services.briefs import generate_brief
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+            source_id = db.execute(
+                """
+                INSERT INTO sources (name, type, url, industry_hint, reliability_score)
+                VALUES ('Test Source', 'media', 'https://example.com/feed', 'artificial_intelligence', 0.8)
+                """
+            )
+            raw_id = db.execute(
+                """
+                INSERT INTO raw_items
+                    (source_id, url, canonical_url, title, published_at, fetched_at, raw_content, content_excerpt,
+                     content_hash, status)
+                VALUES (?, 'https://example.com/item', 'https://example.com/item', 'AI platform update',
+                        NULL, '2026-06-05T08:00:00+00:00', 'AI platform update content', 'AI platform update',
+                        'hash-1', 'processed')
+                """,
+                (source_id,),
+            )
+            processed_id = db.execute(
+                """
+                INSERT INTO processed_items
+                    (raw_item_id, normalized_title, summary, key_facts_json, impact_analysis,
+                     importance_level, rank_score, created_at)
+                VALUES (?, 'AI platform update', 'Summary', '{"impact": "Industry impact"}', 'Impact analysis',
+                        'medium', 0.82, '2026-06-05T08:05:00+00:00')
+                """,
+                (raw_id,),
+            )
+
+            brief = generate_brief(db, brief_type="manual")
+
+            self.assertEqual(brief["time_range_start"], "2026-06-05T08:00:00+00:00")
+            self.assertEqual(brief["time_range_end"], "2026-06-05T08:00:00+00:00")
+            self.assertEqual(from_json(brief["item_ids_json"], []), [processed_id])
+
+
 class IntelligenceApiContractTest(unittest.TestCase):
     def test_industry_subtag_filter_returns_only_items_with_that_tag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1725,6 +1885,104 @@ class WorkflowTraceContractTest(unittest.TestCase):
 
 
 class RealSourceCollectionContractTest(unittest.TestCase):
+    def test_source_interval_scan_runs_through_langgraph_orchestrator(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+            workflow.ensure_sources(db)
+
+            def fake_fetcher(source: dict[str, object]) -> list[dict[str, object]]:
+                return []
+
+            run = workflow.run_source_interval_scan(
+                db,
+                now=datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc),
+                fetcher=fake_fetcher,
+                force_all=True,
+            )
+            trace = from_json(run["node_trace_json"], [])
+
+            self.assertEqual(run["status"], "success")
+            self.assertEqual(trace[0]["input"]["orchestrator"], "langgraph")
+            self.assertEqual(trace[0]["output"]["orchestrator"], "langgraph")
+
+            import app.services.workflow_graph as workflow_graph
+
+            self.assertIn("StateGraph", Path(workflow_graph.__file__).read_text(encoding="utf-8"))
+            self.assertTrue(callable(workflow_graph.build_source_interval_graph))
+
+    def test_manual_collect_api_starts_incremental_scan_in_background(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+            workflow.ensure_sources(db)
+            app = FastAPI()
+            app.include_router(create_router(db))
+            scheduled: list[dict[str, object]] = []
+
+            def fake_background_start(db_arg: Database, **kwargs: object) -> dict[str, object]:
+                scheduled.append({"db": db_arg, **kwargs})
+                run_id = db_arg.execute(
+                    """
+                    INSERT INTO workflow_runs (trigger_type, started_at, status, node_trace_json)
+                    VALUES (?, ?, 'running', '[]')
+                    """,
+                    (kwargs["trigger_type"], "2026-06-05T09:00:00+00:00"),
+                )
+                return db_arg.query_one("SELECT * FROM workflow_runs WHERE id = ?", (run_id,)) or {}
+
+            with patch("app.api.start_source_interval_scan_background", side_effect=fake_background_start):
+                response = TestClient(app).post("/api/collect/manual")
+
+            payload = response.json()
+            run = db.query_one("SELECT * FROM workflow_runs WHERE id = ?", (payload["id"],))
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(payload["status"], "running")
+            self.assertEqual(payload["trigger_type"], "manual_collect")
+            self.assertEqual(run["status"], "running")
+            self.assertEqual(len(scheduled), 1)
+            self.assertEqual(scheduled[0]["trigger_type"], "manual_collect")
+            self.assertTrue(scheduled[0]["force_all"])
+
+    def test_background_source_interval_scan_finishes_incremental_window(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+            workflow.ensure_sources(db)
+            db.execute(
+                "UPDATE sources SET last_fetched_at = ? WHERE id = 1",
+                ("2026-06-05T07:30:00+00:00",),
+            )
+            captured_windows: list[tuple[datetime, datetime]] = []
+            now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+
+            def fake_fetcher(source: dict[str, object]) -> list[dict[str, object]]:
+                if source["id"] == 1:
+                    captured_windows.append((source["published_after"], source["published_before"]))
+                return []
+
+            run = workflow.start_source_interval_scan_background(
+                db,
+                trigger_type="manual_collect",
+                now=now,
+                fetcher=fake_fetcher,
+                force_all=True,
+            )
+
+            for _ in range(50):
+                stored = db.query_one("SELECT * FROM workflow_runs WHERE id = ?", (run["id"],))
+                if stored and stored["status"] != "running":
+                    break
+                time.sleep(0.02)
+            else:
+                self.fail("background manual collect did not finish")
+
+            self.assertEqual(stored["status"], "success")
+            self.assertEqual(
+                captured_windows,
+                [(datetime(2026, 6, 5, 7, 30, tzinfo=timezone.utc), now)],
+            )
+
     def test_source_interval_scan_collects_from_configured_sources_without_demo_items(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / "agent.sqlite3")
@@ -1770,6 +2028,28 @@ class RealSourceCollectionContractTest(unittest.TestCase):
             self.assertGreater(run["failed_count"], 0)
             failed_source = db.query_one("SELECT * FROM sources WHERE last_error IS NOT NULL LIMIT 1")
             self.assertIn("network unavailable", failed_source["last_error"])
+
+    def test_source_interval_scan_treats_no_candidates_as_empty_not_failed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+            workflow.ensure_sources(db)
+
+            run = workflow.run_source_interval_scan(
+                db,
+                now=datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc),
+                fetcher=lambda source: [],
+                force_all=True,
+            )
+            trace = from_json(run["node_trace_json"], [])
+            collect = next(node for node in trace if node["node"] == "collect")
+
+            self.assertEqual(run["status"], "success")
+            self.assertEqual(run["failed_count"], 0)
+            self.assertEqual(db.query_one("SELECT COUNT(*) AS count FROM raw_items")["count"], 0)
+            self.assertTrue(collect["output"]["source_results"])
+            self.assertTrue(all(result["status"] == "empty" for result in collect["output"]["source_results"]))
+            self.assertIsNone(db.query_one("SELECT * FROM sources WHERE last_error IS NOT NULL LIMIT 1"))
 
     def test_due_sources_respects_source_fetch_interval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

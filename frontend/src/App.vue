@@ -21,6 +21,7 @@ const feedListRef = ref(null);
 const activePage = ref("intelligence");
 const loading = ref(false);
 const manualRunning = ref(false);
+const briefRunning = ref(false);
 const moreFilters = ref(true);
 const isFeedHovered = ref(false);
 const isFeedManuallyPaused = ref(false);
@@ -107,7 +108,9 @@ const llmModeDescription = computed(() => {
 });
 
 const AUTO_SCROLL_SPEED = 0.018;
+const RUN_POLL_INTERVAL_MS = 3000;
 let autoScrollFrameId = 0;
+let manualRunPollTimer = 0;
 let lastAutoScrollTime = 0;
 let autoSelectingItemId = null;
 
@@ -121,7 +124,17 @@ function queryString() {
 
 async function request(path, options) {
   const response = await fetch(`${API_BASE}${path}`, options);
-  if (!response.ok) throw new Error(`${path} ${response.status}`);
+  if (!response.ok) {
+    const detailText = await response.text();
+    let detail = detailText;
+    try {
+      const payload = detailText ? JSON.parse(detailText) : {};
+      detail = payload?.detail || payload?.error || "";
+    } catch {
+      detail = detailText;
+    }
+    throw new Error(`${path} ${response.status}${detail ? `: ${detail}` : ""}`);
+  }
   return response.json();
 }
 
@@ -257,19 +270,83 @@ function handleVisibilityChange() {
 }
 
 async function manualCollect() {
+  if (manualRunning.value) return;
   manualRunning.value = true;
+  errorMessage.value = "";
   try {
-    await request("/api/collect/manual", { method: "POST" });
-    await loadAll();
-  } finally {
+    const run = await request("/api/collect/manual", { method: "POST" });
+    upsertRun(run);
+    selectedRun.value = run;
+    activePage.value = "runs";
+    if (run.status === "running") {
+      startManualRunPolling(run.id);
+    } else {
+      manualRunning.value = false;
+      await loadAll();
+    }
+  } catch (error) {
+    errorMessage.value = `手动补采启动失败：${error.message}`;
     manualRunning.value = false;
   }
 }
 
 async function generateBrief() {
-  const brief = await request("/api/briefs/generate", { method: "POST" });
-  briefs.value = [brief, ...briefs.value];
-  activePage.value = "briefs";
+  if (briefRunning.value) return;
+  briefRunning.value = true;
+  errorMessage.value = "";
+  try {
+    const brief = await request("/api/briefs/generate", { method: "POST" });
+    briefs.value = [brief, ...briefs.value.filter((item) => item.id !== brief.id)];
+    activePage.value = "briefs";
+    summary.value = await request("/api/intelligence/summary");
+  } catch (error) {
+    errorMessage.value = `生成筛选简报失败：${error.message}`;
+  } finally {
+    briefRunning.value = false;
+  }
+}
+
+function upsertRun(run) {
+  if (!run?.id) return;
+  const index = runs.value.findIndex((entry) => entry.id === run.id);
+  if (index >= 0) {
+    runs.value.splice(index, 1, run);
+  } else {
+    runs.value = [run, ...runs.value];
+  }
+}
+
+function startManualRunPolling(runId) {
+  stopManualRunPolling();
+  manualRunPollTimer = window.setInterval(() => {
+    refreshManualRun(runId).catch((error) => {
+      errorMessage.value = `刷新补采状态失败：${error.message}`;
+      stopManualRunPolling();
+      manualRunning.value = false;
+    });
+  }, RUN_POLL_INTERVAL_MS);
+  refreshManualRun(runId).catch((error) => {
+    errorMessage.value = `刷新补采状态失败：${error.message}`;
+  });
+}
+
+function stopManualRunPolling() {
+  if (manualRunPollTimer) {
+    window.clearInterval(manualRunPollTimer);
+    manualRunPollTimer = 0;
+  }
+}
+
+async function refreshManualRun(runId) {
+  const runData = await request("/api/runs");
+  runs.value = runData;
+  const run = runData.find((entry) => entry.id === runId) || null;
+  if (run) selectedRun.value = run;
+  if (!run || run.status !== "running") {
+    stopManualRunPolling();
+    manualRunning.value = false;
+    await loadAll();
+  }
 }
 
 function setFilter(key, value) {
@@ -417,6 +494,7 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (autoScrollFrameId) window.cancelAnimationFrame(autoScrollFrameId);
+  stopManualRunPolling();
   if (typeof document !== "undefined") {
     document.removeEventListener("visibilitychange", handleVisibilityChange);
   }
@@ -466,7 +544,9 @@ onUnmounted(() => {
             <strong>{{ llmModeLabel }}</strong>
             <small>{{ llmModeDescription }}</small>
           </span>
-          <button class="secondary" @click="generateBrief">生成筛选简报</button>
+          <button class="secondary" :disabled="briefRunning" @click="generateBrief">
+            {{ briefRunning ? "生成中..." : "生成筛选简报" }}
+          </button>
           <button class="primary" :disabled="manualRunning" @click="manualCollect">
             {{ manualRunning ? "补采中..." : "手动补采" }}
           </button>

@@ -123,15 +123,28 @@ def _screen_with_llm(item: dict[str, Any], llm_client: LLMClient) -> RelevanceRe
     try:
         payload = llm_client.complete_json(
             system_prompt=(
-                "你是产业舆情 Agent 的相关性筛选节点。只判断文章是否属于新能源汽车或人工智能产业情报。"
-                "必须输出 JSON：is_relevant(boolean), industry(string), reason(string), confidence(number), matched_terms(array)。"
-                "industry 只能是 新能源汽车、人工智能 或空字符串。无关泛新闻必须 is_relevant=false。"
+                "你是产业舆情 Agent 的 relevance_screen 相关性筛选节点。"
+                "你的职责是只判断是否进入新能源汽车或人工智能产业情报流水线；不做分类打标、摘要、排序或事实扩写。"
+                "必须基于标题、正文和来源元数据中的证据判断，industry_hint 只能作为弱上下文。"
+                "不要编造正文没有出现的主体、事件、产业归属或关键词。"
+                "必须只输出 JSON，industry 只能是 新能源汽车、人工智能 或空字符串。"
             ),
             user_payload={
                 "title": item.get("title"),
                 "content": item.get("raw_content") or item.get("content_excerpt"),
+                "content_excerpt": item.get("content_excerpt"),
+                "source_name": item.get("source_name"),
                 "source_type": item.get("source_type"),
+                "url": item.get("url"),
+                "published_at": item.get("published_at"),
+                "fetched_at": item.get("fetched_at"),
                 "industry_hint": item.get("industry_hint"),
+                "industry_definitions": _industry_definitions(),
+                "exclusion_rules": _relevance_exclusion_rules(),
+                "decision_rules": _relevance_decision_rules(),
+                "confidence_calibration": _relevance_confidence_calibration(),
+                "output_requirements": _relevance_output_requirements(),
+                "required_json_fields": ["is_relevant", "industry", "reason", "confidence", "matched_terms"],
             },
         )
     except Exception:
@@ -151,6 +164,60 @@ def _screen_with_llm(item: dict[str, Any], llm_client: LLMClient) -> RelevanceRe
         provider=llm_client.settings.provider,
         model=llm_client.settings.model,
     )
+
+
+def _industry_definitions() -> dict[str, str]:
+    return {
+        "新能源汽车": (
+            "与新能源整车、动力电池、智能驾驶、充换电、车载软件、汽车芯片、上游材料、"
+            "产能交付、海外市场、政策监管或核心企业动向直接相关的产业事实。"
+        ),
+        "人工智能": (
+            "与基础模型、AI 芯片、算力基础设施、AI 应用、智能体/Agent、数据与安全、"
+            "机器人、企业服务、政策监管、核心企业动向或商业化进展直接相关的产业事实。"
+        ),
+    }
+
+
+def _relevance_exclusion_rules() -> list[str]:
+    return [
+        "泛社会新闻、网络诈骗、学历认证、治安通报等不因来源为政府或含弱提示而进入产业情报库。",
+        "内部会议、党建学习、青年理论学习、代表大会、宣传纪录片等组织活动，除非正文有明确产业政策或产业项目事实，否则拒绝。",
+        "列表页、分页导航、栏目模板、站点宣传语、广告导流、采购索引等低信息正文必须拒绝。",
+        "只出现 AI、EV、电池、模型等短词，但上下文不是产业事件时必须拒绝。",
+        "只有 industry_hint 或 source_type 指向某产业、正文没有实质产业事实时必须拒绝。",
+    ]
+
+
+def _relevance_decision_rules() -> list[str]:
+    return [
+        "只判断候选是否应进入后续 normalize/deduplicate/classify/rank/extract 流水线。",
+        "is_relevant=true 必须同时满足：正文或标题有实质产业事实，并且能归入且只能归入一个目标行业。",
+        "industry_hint 只能辅助理解来源配置，不能替代正文证据；正文不足时 is_relevant=false。",
+        "matched_terms 必须来自标题、正文或摘要中的实际词语，不要输出同义扩展词。",
+        "reason 用一句话说明放行或拒绝的证据，指出关键行业事实或拒绝原因。",
+        "无法区分新能源汽车与人工智能时，选择正文证据更强的行业；证据不足则拒绝。",
+    ]
+
+
+def _relevance_confidence_calibration() -> dict[str, str]:
+    return {
+        "0.90-1.00": "标题和正文都有明确产业主体、事件和行业归属，且排除规则不命中。",
+        "0.75-0.89": "正文有明确产业事实，但细节较少或来源上下文仍需后续节点补充。",
+        "0.55-0.74": "存在产业相关事实但证据有限；可放行但 reason 必须说明不确定性。",
+        "0.00-0.54": "只有弱相关词、来源提示、模板文本或泛新闻，应拒绝。",
+    }
+
+
+def _relevance_output_requirements() -> dict[str, Any]:
+    return {
+        "format": "只返回单个 JSON object，不要 Markdown 或解释性正文。",
+        "required_fields": ["is_relevant", "industry", "reason", "confidence", "matched_terms"],
+        "industry_enum": ["新能源汽车", "人工智能", ""],
+        "matched_terms": "数组；只能包含输入文本中真实出现并支撑判断的关键词或短语。",
+        "reason": "一句话，必须引用标题、正文、来源属性或排除规则中的证据。",
+        "negative_case": "is_relevant=false 时 industry 必须为空字符串，matched_terms 可为空或列出导致拒绝的噪声词。",
+    }
 
 
 def _screen_with_rules(item: dict[str, Any]) -> RelevanceResult:

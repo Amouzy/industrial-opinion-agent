@@ -139,7 +139,7 @@ class FetchedDocument:
 
 
 class CollectionError(RuntimeError):
-    """Raised when a configured source cannot produce real source records."""
+    """Raised when a configured source cannot be fetched or parsed safely."""
 
 
 class _ListingHTMLParser(HTMLParser):
@@ -750,8 +750,6 @@ def fetch_source_items(
         published_after=source.get("published_after"),
         published_before=source.get("published_before"),
     )
-    if not items:
-        raise CollectionError("No article candidates discovered from source document")
     return items
 
 
