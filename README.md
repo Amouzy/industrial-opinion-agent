@@ -12,10 +12,10 @@
 
 ## 交付文档
 
-- [PRD 文档](docs/desc/PRD_产业舆情Agent.pdf)
-- [工作流编排示意图](docs/desc/工作流编排说明.pdf)
-- [标签体系设计说明](docs/desc/标签设计说明.pdf)
-- [架构与实现说明](docs/desc/项目实施说明.pdf)
+- [PRD 文档](docs/desc/PRD_产业舆情Agent.md)
+- [工作流编排示意图](docs/desc/工作流编排说明.md)
+- [标签体系设计说明](docs/desc/标签设计说明.md)
+- [架构与实现说明](docs/desc/项目实施说明.md)
 
 ## 本地启动
 
