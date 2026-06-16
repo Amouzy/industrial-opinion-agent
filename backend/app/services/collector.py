@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import re
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
@@ -12,6 +13,8 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import urljoin, urlparse
 from urllib.request import Request, urlopen
+
+from app.logging_config import APP_LOGGER_NAME
 
 
 USER_AGENT = (
@@ -129,6 +132,7 @@ PUBLISHED_TEXT_PATTERNS = (
     ),
 )
 URL_DATE_PATTERN = re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})(?!\d)")
+logger = logging.getLogger(APP_LOGGER_NAME)
 
 
 @dataclass(frozen=True)
@@ -907,13 +911,13 @@ def _coerce_datetime(value: datetime | str | None) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _published_in_window(value: str | None, window: tuple[datetime | None, datetime | None]) -> bool:
+def _published_in_window(value: datetime | str | None, window: tuple[datetime | None, datetime | None]) -> bool:
     start, end = window
     if not start and not end:
         return True
     published = _coerce_datetime(value)
     if published is None:
-        return False
+        return True
     comparable = published.astimezone(timezone.utc)
     if start and comparable < start.astimezone(timezone.utc):
         return False
@@ -1100,7 +1104,8 @@ def _parse_html(text: str) -> _ListingHTMLParser:
 def _article_from_fetcher(article_fetcher: Any, url: str) -> dict[str, str | None]:
     try:
         raw_html = article_fetcher(url)
-    except Exception:
+    except Exception as exc:
+        logger.warning("article_fetch_failed url=%s error=%s", url, exc, exc_info=True)
         return {"title": "", "content": "", "published_at": None}
     parser = _parse_html(raw_html)
     return {

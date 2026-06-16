@@ -16,7 +16,15 @@ const selectedItem = ref(null);
 const selectedRun = ref(null);
 const briefs = ref([]);
 const runs = ref([]);
+const runsPage = ref(1);
+const runsPageSize = ref(10);
+const runsTotal = ref(0);
 const sources = ref([]);
+const sourceForm = ref(newSourceForm());
+const editingSourceId = ref(null);
+const sourceSaving = ref(false);
+const sourceDeletingId = ref(null);
+const sourceTogglingId = ref(null);
 const feedListRef = ref(null);
 const activePage = ref("intelligence");
 const loading = ref(false);
@@ -60,8 +68,26 @@ const timeRangeOptions = [
 ];
 
 const limitOptions = ["20", "50", "100", "200"];
+const defaultSourceTypeOptions = [
+  ["government", "政府/监管"],
+  ["exchange", "交易所/公告"],
+  ["company", "企业官网"],
+  ["media", "行业媒体"],
+  ["news_api", "新闻 API"]
+];
+const sourceIndustryHintOptions = [
+  ["ai", "人工智能"],
+  ["new_energy_vehicle", "新能源汽车"],
+  ["new_energy_vehicle,ai", "新能源汽车 + 人工智能"]
+];
 
 const sourceTypeLabels = computed(() => taxonomy.value?.source_types || {});
+const sourceTypeOptions = computed(() => {
+  const labels = sourceTypeLabels.value;
+  return defaultSourceTypeOptions.map(([type, fallbackLabel]) => [type, labels[type] || fallbackLabel]);
+});
+const sourceFormTitle = computed(() => (editingSourceId.value ? "修改数据源" : "新增数据源"));
+const sourceFormSubmitLabel = computed(() => (editingSourceId.value ? "保存修改" : "新增数据源"));
 const visibleSubtags = computed(() => {
   const subtags = taxonomy.value?.industry_subtags || {};
   if (filters.value.industry) {
@@ -71,6 +97,9 @@ const visibleSubtags = computed(() => {
 });
 const selectedOrFirstItem = computed(() => selectedItem.value || items.value[0] || null);
 const selectedOrFirstRun = computed(() => selectedRun.value || runs.value[0] || null);
+const runsTotalPages = computed(() => Math.max(1, Math.ceil(runsTotal.value / runsPageSize.value)));
+const runsPageStart = computed(() => (runsTotal.value ? (runsPage.value - 1) * runsPageSize.value + 1 : 0));
+const runsPageEnd = computed(() => Math.min(runsTotal.value, runsPage.value * runsPageSize.value));
 const selectedTraceNodes = computed(() => selectedOrFirstItem.value?.item_processing_trace || []);
 const canAutoInspectFeed = computed(() => items.value.length > 5);
 const isFeedInspectionRunning = computed(() =>
@@ -122,6 +151,10 @@ function queryString() {
   return params.toString();
 }
 
+function runsApiPath(page = runsPage.value) {
+  return `/api/runs?page=${page}&page_size=${runsPageSize.value}`;
+}
+
 async function request(path, options) {
   const response = await fetch(`${API_BASE}${path}`, options);
   if (!response.ok) {
@@ -146,19 +179,16 @@ async function loadAll() {
       request("/api/intelligence/summary"),
       request("/api/taxonomy"),
       request("/api/briefs"),
-      request("/api/runs"),
+      request(runsApiPath()),
       request("/api/sources"),
       request("/api/llm/status")
     ]);
     summary.value = summaryData;
     taxonomy.value = taxonomyData;
     briefs.value = briefsData;
-    runs.value = runsData;
+    applyRunsPayload(runsData);
     sources.value = sourcesData;
     llmStatus.value = llmData;
-    if (!runsData.find((run) => run.id === selectedRun.value?.id)) {
-      selectedRun.value = runsData[0] || null;
-    }
     await loadItems();
   } catch (error) {
     errorMessage.value = `无法连接后端 API：${error.message}`;
@@ -175,6 +205,30 @@ async function loadItems() {
   await nextTick();
   if (feedListRef.value) feedListRef.value.scrollTop = 0;
   syncSelectedItemWithScroll();
+}
+
+async function loadSources() {
+  sources.value = await request("/api/sources");
+}
+
+function applyRunsPayload(payload) {
+  const payloadItems = Array.isArray(payload) ? payload : payload?.items || [];
+  runs.value = payloadItems;
+  runsTotal.value = Array.isArray(payload) ? payloadItems.length : payload?.total || 0;
+  runsPage.value = Array.isArray(payload) ? runsPage.value : payload?.page || 1;
+  runsPageSize.value = Array.isArray(payload) ? runsPageSize.value : payload?.page_size || runsPageSize.value;
+  if (!payloadItems.find((run) => run.id === selectedRun.value?.id)) {
+    selectedRun.value = payloadItems[0] || null;
+  }
+}
+
+async function loadRuns(page = runsPage.value) {
+  const payload = await request(runsApiPath(page));
+  applyRunsPayload(payload);
+  if (!runs.value.length && runsTotal.value > 0 && runsPage.value > runsTotalPages.value) {
+    return loadRuns(runsTotalPages.value);
+  }
+  return payload;
 }
 
 async function selectItem(item) {
@@ -312,7 +366,9 @@ function upsertRun(run) {
   if (index >= 0) {
     runs.value.splice(index, 1, run);
   } else {
-    runs.value = [run, ...runs.value];
+    runsTotal.value += 1;
+    runsPage.value = 1;
+    runs.value = [run, ...runs.value].slice(0, runsPageSize.value);
   }
 }
 
@@ -338,15 +394,23 @@ function stopManualRunPolling() {
 }
 
 async function refreshManualRun(runId) {
-  const runData = await request("/api/runs");
-  runs.value = runData;
-  const run = runData.find((entry) => entry.id === runId) || null;
+  const runData = await loadRuns(1);
+  const runItems = Array.isArray(runData) ? runData : runData.items || [];
+  const run = runItems.find((entry) => entry.id === runId) || null;
   if (run) selectedRun.value = run;
   if (!run || run.status !== "running") {
     stopManualRunPolling();
     manualRunning.value = false;
     await loadAll();
   }
+}
+
+function goToRunsPage(page) {
+  const nextPage = Math.min(Math.max(1, page), runsTotalPages.value);
+  if (nextPage === runsPage.value) return;
+  loadRuns(nextPage).catch((error) => {
+    errorMessage.value = `刷新采集运行记录失败：${error.message}`;
+  });
 }
 
 function setFilter(key, value) {
@@ -399,6 +463,109 @@ function originalUrl(item) {
 
 function selectRun(run) {
   selectedRun.value = run;
+}
+
+function newSourceForm() {
+  return {
+    name: "",
+    type: "company",
+    url: "",
+    industry_hint: "ai",
+    reliability_score: 0.85,
+    enabled: true,
+    fetch_interval_minutes: 60
+  };
+}
+
+function resetSourceForm() {
+  editingSourceId.value = null;
+  sourceForm.value = newSourceForm();
+}
+
+function editSource(source) {
+  editingSourceId.value = source.id;
+  sourceForm.value = {
+    name: source.name || "",
+    type: source.type || "company",
+    url: source.url || "",
+    industry_hint: source.industry_hint || "",
+    reliability_score: Number(source.reliability_score ?? 0.5),
+    enabled: Boolean(source.enabled),
+    fetch_interval_minutes: Number(source.fetch_interval_minutes || 60)
+  };
+}
+
+function sourceFormPayload() {
+  return {
+    ...sourceForm.value,
+    reliability_score: Number(sourceForm.value.reliability_score),
+    fetch_interval_minutes: Number(sourceForm.value.fetch_interval_minutes),
+    industry_hint: sourceForm.value.industry_hint
+  };
+}
+
+async function saveSource() {
+  if (sourceSaving.value) return;
+  sourceSaving.value = true;
+  errorMessage.value = "";
+  try {
+    const path = editingSourceId.value ? `/api/sources/${editingSourceId.value}` : "/api/sources";
+    await request(path, {
+      method: editingSourceId.value ? "PATCH" : "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(sourceFormPayload())
+    });
+    await loadSources();
+    summary.value = await request("/api/intelligence/summary");
+    resetSourceForm();
+  } catch (error) {
+    errorMessage.value = `保存数据源失败：${error.message}`;
+  } finally {
+    sourceSaving.value = false;
+  }
+}
+
+async function deleteSource(source) {
+  if (!window.confirm(`确认删除数据源「${source.name}」？已有采集记录的数据源会被后端拒绝删除。`)) return;
+  sourceDeletingId.value = source.id;
+  errorMessage.value = "";
+  try {
+    await request(`/api/sources/${source.id}`, { method: "DELETE" });
+    await loadSources();
+    summary.value = await request("/api/intelligence/summary");
+    if (editingSourceId.value === source.id) resetSourceForm();
+  } catch (error) {
+    errorMessage.value = `删除数据源失败：${error.message}`;
+  } finally {
+    sourceDeletingId.value = null;
+  }
+}
+
+async function toggleSourceEnabled(source) {
+  if (sourceTogglingId.value) return;
+  sourceTogglingId.value = source.id;
+  errorMessage.value = "";
+  try {
+    const updated = await request(`/api/sources/${source.id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ enabled: !source.enabled })
+    });
+    const index = sources.value.findIndex((entry) => entry.id === source.id);
+    if (index >= 0) sources.value.splice(index, 1, updated);
+    summary.value = await request("/api/intelligence/summary");
+    if (editingSourceId.value === source.id) {
+      sourceForm.value.enabled = updated.enabled;
+    }
+  } catch (error) {
+    errorMessage.value = `切换数据源状态失败：${error.message}`;
+  } finally {
+    sourceTogglingId.value = null;
+  }
+}
+
+function sourceIndustryHintLabel(value) {
+  return sourceIndustryHintOptions.find(([hint]) => hint === value)?.[1] || "未设置行业提示";
 }
 
 function nodeLabel(node) {
@@ -913,6 +1080,27 @@ onUnmounted(() => {
               <span>采集 {{ run.collected_count }} · 去重 {{ run.deduped_count }} · 分类 {{ run.classified_count }}</span>
               <span>{{ formatTime(run.started_at) }}</span>
             </button>
+            <div class="run-pagination">
+              <button
+                class="run-page-button"
+                type="button"
+                :disabled="runsPage <= 1"
+                @click="goToRunsPage(runsPage - 1)"
+              >
+                上一页
+              </button>
+              <span class="run-page-status">
+                {{ runsPageStart }}-{{ runsPageEnd }} / {{ runsTotal }} · 第 {{ runsPage }} / {{ runsTotalPages }} 页
+              </span>
+              <button
+                class="run-page-button"
+                type="button"
+                :disabled="runsPage >= runsTotalPages"
+                @click="goToRunsPage(runsPage + 1)"
+              >
+                下一页
+              </button>
+            </div>
           </div>
           <article v-if="selectedOrFirstRun" class="trace-panel">
             <div class="trace-head">
@@ -948,13 +1136,82 @@ onUnmounted(() => {
       </section>
 
       <section v-else-if="activePage === 'sources'" class="page-panel glass">
-        <h2>数据源配置</h2>
+        <div class="source-page-head">
+          <h2>数据源配置</h2>
+          <button class="secondary" type="button" @click="resetSourceForm">新增</button>
+        </div>
+        <form class="source-form" @submit.prevent="saveSource">
+          <div class="source-form-title">
+            <strong>{{ sourceFormTitle }}</strong>
+            <span v-if="editingSourceId">#{{ editingSourceId }}</span>
+          </div>
+          <label>
+            <span>名称</span>
+            <input v-model.trim="sourceForm.name" class="input-like" required maxlength="200" />
+          </label>
+          <label>
+            <span>类型</span>
+            <select v-model="sourceForm.type" class="input-like" required>
+              <option v-for="[type, label] in sourceTypeOptions" :key="type" :value="type">{{ label }}</option>
+            </select>
+          </label>
+          <label class="source-form-priority">
+            <span>权威分</span>
+            <input v-model.number="sourceForm.reliability_score" class="input-like" type="number" min="0" max="1" step="0.01" required />
+          </label>
+          <label class="source-form-wide">
+            <span>URL</span>
+            <input v-model.trim="sourceForm.url" class="input-like" type="url" required maxlength="1000" />
+          </label>
+          <label>
+            <span>行业提示</span>
+            <select v-model="sourceForm.industry_hint" class="input-like" required>
+              <option v-for="[hint, label] in sourceIndustryHintOptions" :key="hint" :value="hint">{{ label }}</option>
+            </select>
+          </label>
+          <label>
+            <span>检查间隔</span>
+            <input v-model.number="sourceForm.fetch_interval_minutes" class="input-like" type="number" min="1" max="10080" step="1" required />
+          </label>
+          <label class="source-toggle">
+            <input v-model="sourceForm.enabled" type="checkbox" />
+            <span>启用</span>
+          </label>
+          <div class="source-form-actions">
+            <button class="primary" type="submit" :disabled="sourceSaving">{{ sourceSaving ? "保存中" : sourceFormSubmitLabel }}</button>
+            <button v-if="editingSourceId" class="secondary" type="button" @click="resetSourceForm">取消</button>
+          </div>
+        </form>
         <div class="source-grid">
           <article v-for="source in sources" :key="source.id" class="source-card">
-            <strong>{{ source.name }}</strong>
+            <div class="source-card-head">
+              <strong>{{ source.name }}</strong>
+              <button
+                :class="['source-switch', { active: source.enabled }]"
+                type="button"
+                role="switch"
+                :aria-checked="source.enabled"
+                :disabled="sourceTogglingId === source.id"
+                @click="toggleSourceEnabled(source)"
+              >
+                <span class="source-switch-thumb"></span>
+                <span>{{ source.enabled ? "启用" : "停用" }}</span>
+              </button>
+            </div>
             <span>{{ sourceTypeLabels[source.type] || source.type }} · 权威 {{ formatScore(source.reliability_score) }}</span>
-            <span>每 {{ source.fetch_interval_minutes }} 分钟检查 · {{ source.enabled ? "启用" : "停用" }}</span>
+            <span>每 {{ source.fetch_interval_minutes }} 分钟检查 · {{ sourceIndustryHintLabel(source.industry_hint) }}</span>
             <a :href="source.url" target="_blank" rel="noreferrer">{{ source.url }}</a>
+            <div class="source-card-actions">
+              <button class="text-button" type="button" @click="editSource(source)">编辑</button>
+              <button
+                class="text-button danger"
+                type="button"
+                :disabled="sourceDeletingId === source.id"
+                @click="deleteSource(source)"
+              >
+                {{ sourceDeletingId === source.id ? "删除中" : "删除" }}
+              </button>
+            </div>
           </article>
         </div>
       </section>

@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
+import logging
+import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from threading import Thread
@@ -7,6 +10,7 @@ from typing import Any, Callable
 
 from app.config import get_settings
 from app.database import Database, from_json, to_json
+from app.logging_config import APP_LOGGER_NAME
 from app.seed_data import LEGACY_URL_REPLACEMENTS, SOURCE_CONFIGS, demo_raw_items
 from app.services.briefs import generate_brief
 from app.services.classifier import classify_item
@@ -20,6 +24,7 @@ from app.services.time_utils import parse_iso, utc_now_iso
 
 
 SourceFetcher = Callable[[dict[str, Any]], list[dict[str, Any]]]
+logger = logging.getLogger(APP_LOGGER_NAME)
 
 
 def ensure_seed_data(db: Database) -> None:
@@ -119,8 +124,29 @@ def run_source_interval_scan(
     current = now or datetime.now(timezone.utc)
     running = db.query_one("SELECT id, trigger_type, started_at FROM workflow_runs WHERE status = 'running' ORDER BY started_at DESC LIMIT 1")
     if running:
+        logger.info(
+            "workflow_skipped trigger_type=%s running_run_id=%s running_trigger_type=%s running_started_at=%s",
+            trigger_type,
+            running["id"],
+            running["trigger_type"],
+            running["started_at"],
+        )
         return _insert_skipped_run(db, trigger_type, running)
-    run_id = _insert_running_run(db, trigger_type)
+    try:
+        run_id = _insert_running_run(db, trigger_type)
+    except sqlite3.IntegrityError:
+        running = db.query_one("SELECT id, trigger_type, started_at FROM workflow_runs WHERE status = 'running' ORDER BY started_at DESC LIMIT 1")
+        if running:
+            logger.info(
+                "workflow_skipped trigger_type=%s running_run_id=%s running_trigger_type=%s running_started_at=%s",
+                trigger_type,
+                running["id"],
+                running["trigger_type"],
+                running["started_at"],
+            )
+            return _insert_skipped_run(db, trigger_type, running)
+        raise
+    logger.info("workflow_start run_id=%s trigger_type=%s force_all=%s", run_id, trigger_type, force_all)
     from app.services.workflow_graph import run_source_interval_graph
 
     return run_source_interval_graph(db, run_id, trigger_type, current, fetcher, force_all)
@@ -137,7 +163,13 @@ def start_source_interval_scan_background(
     running = db.query_one("SELECT id, trigger_type, started_at FROM workflow_runs WHERE status = 'running' ORDER BY started_at DESC LIMIT 1")
     if running:
         return _insert_skipped_run(db, trigger_type, running)
-    run_id = _insert_running_run(db, trigger_type)
+    try:
+        run_id = _insert_running_run(db, trigger_type)
+    except sqlite3.IntegrityError:
+        running = db.query_one("SELECT id, trigger_type, started_at FROM workflow_runs WHERE status = 'running' ORDER BY started_at DESC LIMIT 1")
+        if running:
+            return _insert_skipped_run(db, trigger_type, running)
+        raise
     row = db.query_one("SELECT * FROM workflow_runs WHERE id = ?", (run_id,)) or {}
     from app.services.workflow_graph import build_source_interval_graph
 
@@ -192,7 +224,7 @@ def _execute_source_interval_scan_safely(
 
         run_source_interval_graph(db, run_id, trigger_type, current, fetcher, force_all)
     except Exception:
-        pass
+        logger.exception("workflow_background_error run_id=%s trigger_type=%s", run_id, trigger_type)
 
 
 def _execute_source_interval_scan(
@@ -204,11 +236,20 @@ def _execute_source_interval_scan(
     force_all: bool,
     orchestrator: str = "python-sequential",
 ) -> dict[str, Any]:
+    stage_started = time.perf_counter()
     checked_at = current.isoformat()
     target_sources = (
         db.query("SELECT * FROM sources WHERE enabled = 1 ORDER BY reliability_score DESC, id")
         if force_all
         else due_sources(db, current)
+    )
+    logger.info(
+        "workflow_collect_start run_id=%s trigger_type=%s orchestrator=%s force_all=%s target_sources=%s",
+        run_id,
+        trigger_type,
+        orchestrator,
+        force_all,
+        len(target_sources),
     )
     trace: list[dict[str, Any]] = []
     raw_candidates: list[dict[str, Any]] = []
@@ -225,6 +266,12 @@ def _execute_source_interval_scan(
                     "published_before": window_end.isoformat(),
                 }
             )
+            logger.info(
+                "workflow_source_collect_start run_id=%s source_id=%s source_name=%s",
+                run_id,
+                source["id"],
+                source["name"],
+            )
             db.execute("UPDATE sources SET last_checked_at = ? WHERE id = ?", (checked_at, source["id"]))
             try:
                 candidates = fetcher(
@@ -237,6 +284,13 @@ def _execute_source_interval_scan(
             except Exception as exc:
                 failed_count += 1
                 error = str(exc)
+                logger.warning(
+                    "workflow_source_collect_failed run_id=%s source_id=%s source_name=%s error=%s",
+                    run_id,
+                    source["id"],
+                    source["name"],
+                    error,
+                )
                 db.execute(
                     "UPDATE sources SET last_checked_at = ?, last_error = ? WHERE id = ?",
                     (checked_at, error, source["id"]),
@@ -245,9 +299,15 @@ def _execute_source_interval_scan(
                 continue
 
             if not candidates:
+                logger.info(
+                    "workflow_source_collect_empty run_id=%s source_id=%s source_name=%s",
+                    run_id,
+                    source["id"],
+                    source["name"],
+                )
                 db.execute(
-                    "UPDATE sources SET last_checked_at = ?, last_fetched_at = ?, last_error = NULL WHERE id = ?",
-                    (checked_at, checked_at, source["id"]),
+                    "UPDATE sources SET last_checked_at = ?, last_error = NULL WHERE id = ?",
+                    (checked_at, source["id"]),
                 )
                 source_results.append(_source_result(source, "empty", 0, None))
                 continue
@@ -262,6 +322,13 @@ def _execute_source_interval_scan(
                 for candidate in candidates
             ]
             raw_candidates.extend(source_candidates)
+            logger.info(
+                "workflow_source_collect_success run_id=%s source_id=%s source_name=%s candidates=%s",
+                run_id,
+                source["id"],
+                source["name"],
+                len(source_candidates),
+            )
             db.execute(
                 "UPDATE sources SET last_checked_at = ?, last_fetched_at = ?, last_error = NULL WHERE id = ?",
                 (checked_at, checked_at, source["id"]),
@@ -269,6 +336,14 @@ def _execute_source_interval_scan(
             source_results.append(_source_result(source, "success", len(source_candidates), None))
 
         enabled_count = db.query_one("SELECT COUNT(*) AS count FROM sources WHERE enabled = 1")["count"]
+        logger.info(
+            "workflow_collect_finish run_id=%s target_sources=%s candidates=%s failed_sources=%s duration_seconds=%.3f",
+            run_id,
+            len(target_sources),
+            len(raw_candidates),
+            failed_count,
+            time.perf_counter() - stage_started,
+        )
         trace.append(
             _trace_node(
                 "collect",
@@ -290,7 +365,16 @@ def _execute_source_interval_scan(
             )
         )
         llm_client = build_llm_client(get_settings().llm)
+        relevance_started = time.perf_counter()
         relevant_candidates, rejected_candidates = _screen_relevant_candidates(raw_candidates, llm_client)
+        logger.info(
+            "workflow_relevance_finish run_id=%s candidates=%s accepted=%s rejected=%s duration_seconds=%.3f",
+            run_id,
+            len(raw_candidates),
+            len(relevant_candidates),
+            len(rejected_candidates),
+            time.perf_counter() - relevance_started,
+        )
         trace.append(
             _trace_node(
                 "relevance_screen",
@@ -305,6 +389,7 @@ def _execute_source_interval_scan(
         )
         _process_candidates(db, run_id, trigger_type, relevant_candidates, trace, failed_count, llm_client=llm_client)
     except Exception as exc:
+        logger.exception("workflow_failed run_id=%s trigger_type=%s error=%s", run_id, trigger_type, exc)
         db.execute(
             """
             UPDATE workflow_runs
@@ -351,6 +436,7 @@ def run_workflow(db: Database, trigger_type: str = "manual_collect", seed_demo_i
         )
         _process_candidates(db, run_id, trigger_type, raw_candidates, trace, 0)
     except Exception as exc:
+        logger.exception("workflow_failed run_id=%s trigger_type=%s error=%s", run_id, trigger_type, exc)
         db.execute(
             """
             UPDATE workflow_runs
@@ -373,6 +459,13 @@ def _process_candidates(
     llm_client: LLMClient | None = None,
     finalize_run: bool = True,
 ) -> dict[str, Any]:
+    processing_started = time.perf_counter()
+    logger.info(
+        "workflow_process_start run_id=%s trigger_type=%s candidates=%s",
+        run_id,
+        trigger_type,
+        len(raw_candidates),
+    )
     sources = {row["id"]: row for row in db.query("SELECT * FROM sources WHERE enabled = 1")}
     raw_item_ids: list[int] = []
     raw_item_summaries: list[dict[str, Any]] = []
@@ -461,6 +554,13 @@ def _process_candidates(
                 }
             )
         )
+    logger.info(
+        "workflow_normalize_finish run_id=%s candidates=%s raw_items=%s failed_count=%s",
+        run_id,
+        len(raw_candidates),
+        len(raw_item_ids),
+        failed_count,
+    )
     trace.append(
         _trace_node(
             "normalize",
@@ -474,6 +574,12 @@ def _process_candidates(
 
     raw_items = _load_scoped_raw_items(db, raw_item_ids)
     clusters = _cluster_raw_items(db, raw_items)
+    logger.info(
+        "workflow_deduplicate_finish run_id=%s raw_items=%s clusters=%s",
+        run_id,
+        len(raw_items),
+        len(clusters),
+    )
     trace.append(
         _trace_node(
             "deduplicate",
@@ -507,6 +613,13 @@ def _process_candidates(
             if existing_processed:
                 processed_summaries.append(_processed_item_trace_summary(db, existing_processed, item, cluster_id))
                 continue
+            if processed_count == 0 or (processed_count + 1) % 10 == 0:
+                logger.info(
+                    "workflow_classify_extract_progress run_id=%s processed=%s total_raw_items=%s",
+                    run_id,
+                    processed_count,
+                    len(raw_items),
+                )
             classification = classify_item(item, llm_client=llm_client)
             extraction = extract_intelligence(item, classification, llm_client=llm_client)
             key_facts = extraction.key_facts
@@ -614,6 +727,13 @@ def _process_candidates(
                 {"brief_id": brief.get("id"), "title": brief.get("title")},
             )
         )
+    logger.info(
+        "workflow_classify_extract_finish run_id=%s processed=%s total_raw_items=%s duration_seconds=%.3f",
+        run_id,
+        processed_count,
+        len(raw_items),
+        time.perf_counter() - processing_started,
+    )
     completion = {
         "collected_count": len(raw_item_ids),
         "deduped_count": len(clusters),
@@ -641,6 +761,16 @@ def _process_candidates(
                 run_id,
             ),
         )
+    logger.info(
+        "workflow_process_finish run_id=%s collected=%s deduped=%s classified=%s extracted=%s failed=%s duration_seconds=%.3f",
+        run_id,
+        completion["collected_count"],
+        completion["deduped_count"],
+        completion["classified_count"],
+        completion["extracted_count"],
+        completion["failed_count"],
+        time.perf_counter() - processing_started,
+    )
     return completion
 
 
@@ -650,7 +780,10 @@ def _screen_relevant_candidates(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     accepted: list[dict[str, Any]] = []
     rejected: list[dict[str, Any]] = []
-    for candidate in raw_candidates:
+    total = len(raw_candidates)
+    if total:
+        logger.info("workflow_relevance_start candidates=%s", total)
+    for index, candidate in enumerate(raw_candidates, start=1):
         result = screen_relevance(candidate, llm_client=llm_client)
         if result.is_relevant:
             accepted.append(
@@ -666,6 +799,14 @@ def _screen_relevant_candidates(
             )
         else:
             rejected.append(result.to_trace(candidate))
+        if total and (index == 1 or index % 10 == 0 or index == total):
+            logger.info(
+                "workflow_relevance_progress processed=%s total=%s accepted=%s rejected=%s",
+                index,
+                total,
+                len(accepted),
+                len(rejected),
+            )
     return accepted, rejected
 
 

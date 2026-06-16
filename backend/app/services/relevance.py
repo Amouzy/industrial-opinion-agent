@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.logging_config import APP_LOGGER_NAME
 from app.services.llm import LLMClient
+
+
+logger = logging.getLogger(APP_LOGGER_NAME)
 
 
 @dataclass(frozen=True)
@@ -147,12 +152,41 @@ def _screen_with_llm(item: dict[str, Any], llm_client: LLMClient) -> RelevanceRe
                 "required_json_fields": ["is_relevant", "industry", "reason", "confidence", "matched_terms"],
             },
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "relevance_llm_failed source_id=%s title=%r url=%s provider=%s model=%s error=%s",
+            item.get("source_id"),
+            item.get("title"),
+            item.get("url"),
+            getattr(llm_client.settings, "provider", "unknown"),
+            getattr(llm_client.settings, "model", "unknown"),
+            exc,
+            exc_info=True,
+        )
         return None
     industry = str(payload.get("industry") or "")
     if industry not in {"新能源汽车", "人工智能", ""}:
+        logger.warning(
+            "relevance_llm_invalid_payload source_id=%s title=%r url=%s provider=%s model=%s invalid_industry=%r payload_keys=%s",
+            item.get("source_id"),
+            item.get("title"),
+            item.get("url"),
+            getattr(llm_client.settings, "provider", "unknown"),
+            getattr(llm_client.settings, "model", "unknown"),
+            industry,
+            sorted(payload.keys()) if isinstance(payload, dict) else type(payload).__name__,
+        )
         return None
     if bool(payload.get("is_relevant")) and industry not in {"新能源汽车", "人工智能"}:
+        logger.warning(
+            "relevance_llm_invalid_payload source_id=%s title=%r url=%s provider=%s model=%s relevant_without_industry payload_keys=%s",
+            item.get("source_id"),
+            item.get("title"),
+            item.get("url"),
+            getattr(llm_client.settings, "provider", "unknown"),
+            getattr(llm_client.settings, "model", "unknown"),
+            sorted(payload.keys()) if isinstance(payload, dict) else type(payload).__name__,
+        )
         return None
     matched_terms = [str(term) for term in payload.get("matched_terms", []) if str(term).strip()]
     return RelevanceResult(

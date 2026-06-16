@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.logging_config import APP_LOGGER_NAME
 from app.services.llm import LLMClient
 from app.services.taxonomy import (
     EVENT_TYPE_ORDER,
@@ -19,6 +21,9 @@ from app.services.taxonomy import (
     SUBJECT_ROLE_ORDER,
     SUBJECT_ROLES,
 )
+
+
+logger = logging.getLogger(APP_LOGGER_NAME)
 
 
 class ClassificationError(ValueError):
@@ -100,8 +105,28 @@ def classify_item(
                 ) = _apply_structured_override(industry, llm_payload, rules)
                 llm_provider = llm_client.settings.provider
                 llm_model = llm_client.settings.model
-            except ClassificationError:
-                pass
+            except ClassificationError as exc:
+                logger.warning(
+                    "classifier_llm_invalid_payload source_id=%s title=%r url=%s provider=%s model=%s error=%s payload_keys=%s",
+                    item.get("source_id"),
+                    item.get("title"),
+                    item.get("url"),
+                    getattr(llm_client.settings, "provider", "unknown"),
+                    getattr(llm_client.settings, "model", "unknown"),
+                    exc,
+                    sorted(llm_payload.keys()) if isinstance(llm_payload, dict) else type(llm_payload).__name__,
+                    exc_info=True,
+                )
+        elif llm_payload is not None:
+            logger.warning(
+                "classifier_llm_incomplete_payload source_id=%s title=%r url=%s provider=%s model=%s payload_keys=%s",
+                item.get("source_id"),
+                item.get("title"),
+                item.get("url"),
+                getattr(llm_client.settings, "provider", "unknown"),
+                getattr(llm_client.settings, "model", "unknown"),
+                sorted(llm_payload.keys()) if isinstance(llm_payload, dict) else type(llm_payload).__name__,
+            )
 
     _validate_result(industry, subtags, event_types, importance_level, subject_roles, signal_attributes)
     return ClassificationResult(
@@ -193,7 +218,18 @@ def _classify_with_llm(
                 ],
             },
         )
-    except Exception:
+    except Exception as exc:
+        logger.warning(
+            "classifier_llm_failed source_id=%s title=%r url=%s provider=%s model=%s industry=%s error=%s",
+            item.get("source_id"),
+            item.get("title"),
+            item.get("url"),
+            getattr(llm_client.settings, "provider", "unknown"),
+            getattr(llm_client.settings, "model", "unknown"),
+            industry,
+            exc,
+            exc_info=True,
+        )
         return None
 
 

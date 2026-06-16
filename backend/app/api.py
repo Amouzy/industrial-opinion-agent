@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import sqlite3
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, HTTPException, Query
+from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import get_settings
 from app.database import Database, from_json
@@ -21,6 +23,30 @@ from app.services.taxonomy import (
     SUBJECT_ROLE_ORDER,
 )
 from app.services.workflow import start_source_interval_scan_background
+
+
+class SourceCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=200)
+    type: str = Field(min_length=1, max_length=50)
+    url: str = Field(min_length=1, max_length=1000)
+    industry_hint: str | None = Field(default=None, max_length=200)
+    reliability_score: float = Field(default=0.5, ge=0, le=1)
+    enabled: bool = True
+    fetch_interval_minutes: int = Field(default=120, ge=1, le=10080)
+
+
+class SourceUpdateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    type: str | None = Field(default=None, min_length=1, max_length=50)
+    url: str | None = Field(default=None, min_length=1, max_length=1000)
+    industry_hint: str | None = Field(default=None, max_length=200)
+    reliability_score: float | None = Field(default=None, ge=0, le=1)
+    enabled: bool | None = None
+    fetch_interval_minutes: int | None = Field(default=None, ge=1, le=10080)
 
 
 def create_router(db: Database) -> APIRouter:
@@ -149,9 +175,22 @@ def create_router(db: Database) -> APIRouter:
         return {**row, "item_ids": from_json(row.get("item_ids_json"), [])}
 
     @router.get("/runs")
-    def runs() -> list[dict[str, Any]]:
-        rows = db.query("SELECT * FROM workflow_runs ORDER BY started_at DESC LIMIT 30")
-        return [{**row, "node_trace": from_json(row.get("node_trace_json"), [])} for row in rows]
+    def runs(
+        page: int = Query(1, ge=1),
+        page_size: int = Query(10, ge=1, le=100),
+    ) -> dict[str, Any]:
+        total = db.query_one("SELECT COUNT(*) AS count FROM workflow_runs")["count"]
+        offset = (page - 1) * page_size
+        rows = db.query(
+            "SELECT * FROM workflow_runs ORDER BY started_at DESC, id DESC LIMIT ? OFFSET ?",
+            (page_size, offset),
+        )
+        return {
+            "items": [{**row, "node_trace": from_json(row.get("node_trace_json"), [])} for row in rows],
+            "total": total,
+            "page": page,
+            "page_size": page_size,
+        }
 
     @router.post("/collect/manual")
     def manual_collect() -> dict[str, Any]:
@@ -160,7 +199,55 @@ def create_router(db: Database) -> APIRouter:
 
     @router.get("/sources")
     def sources() -> list[dict[str, Any]]:
-        return db.query("SELECT * FROM sources ORDER BY type, reliability_score DESC, id")
+        rows = db.query("SELECT * FROM sources ORDER BY type, reliability_score DESC, id")
+        return [_source_response(row) for row in rows]
+
+    @router.post("/sources", status_code=201)
+    def create_source(payload: SourceCreateRequest) -> dict[str, Any]:
+        data = _source_payload(payload.model_dump())
+        try:
+            source_id = db.execute(
+                """
+                INSERT INTO sources (name, type, url, industry_hint, reliability_score, enabled, fetch_interval_minutes)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    data["name"],
+                    data["type"],
+                    data["url"],
+                    data.get("industry_hint"),
+                    data["reliability_score"],
+                    data["enabled"],
+                    data["fetch_interval_minutes"],
+                ),
+            )
+        except sqlite3.IntegrityError as exc:
+            raise HTTPException(status_code=409, detail="数据源 URL 已存在") from exc
+        return _source_response(_source_or_404(db, source_id))
+
+    @router.patch("/sources/{source_id}")
+    def update_source(source_id: int, payload: SourceUpdateRequest) -> dict[str, Any]:
+        _source_or_404(db, source_id)
+        updates = _source_payload(payload.model_dump(exclude_unset=True))
+        if updates:
+            assignments = ", ".join(f"{key} = ?" for key in updates)
+            try:
+                db.execute(
+                    f"UPDATE sources SET {assignments} WHERE id = ?",
+                    (*updates.values(), source_id),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise HTTPException(status_code=409, detail="数据源 URL 已存在") from exc
+        return _source_response(_source_or_404(db, source_id))
+
+    @router.delete("/sources/{source_id}")
+    def delete_source(source_id: int) -> dict[str, int]:
+        _source_or_404(db, source_id)
+        raw_count = db.query_one("SELECT COUNT(*) AS count FROM raw_items WHERE source_id = ?", (source_id,))["count"]
+        if raw_count:
+            raise HTTPException(status_code=409, detail="该数据源已有采集记录，不能删除；可先停用该数据源。")
+        db.execute("DELETE FROM sources WHERE id = ?", (source_id,))
+        return {"deleted": source_id}
 
     @router.get("/taxonomy")
     def taxonomy() -> dict[str, Any]:
@@ -211,6 +298,30 @@ def _decorate_item(db: Database, row: dict[str, Any]) -> dict[str, Any]:
         "tags_by_dimension": tags_by_dimension,
         "source_type_label": SOURCE_TYPE_LABELS.get(row.get("source_type"), row.get("source_type")),
     }
+
+
+def _source_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for key, value in payload.items():
+        if isinstance(value, str):
+            value = value.strip()
+        if key == "industry_hint" and value == "":
+            value = None
+        if key == "enabled" and value is not None:
+            value = 1 if value else 0
+        normalized[key] = value
+    return normalized
+
+
+def _source_or_404(db: Database, source_id: int) -> dict[str, Any]:
+    source = db.query_one("SELECT * FROM sources WHERE id = ?", (source_id,))
+    if not source:
+        raise HTTPException(status_code=404, detail="数据源不存在")
+    return source
+
+
+def _source_response(row: dict[str, Any]) -> dict[str, Any]:
+    return {**row, "enabled": bool(row.get("enabled"))}
 
 
 def _similar_reports(db: Database, cluster_id: int | None) -> list[dict[str, Any]]:

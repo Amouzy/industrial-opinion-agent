@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import math
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -178,6 +179,32 @@ class ClassificationContractTest(unittest.TestCase):
         self.assertEqual(result.llm_provider, "rules+structured-output")
         self.assertEqual(result.llm_model, "local-rules")
 
+    def test_classification_logs_when_llm_call_fails_and_rules_fallback_is_used(self) -> None:
+        class FakeSettings:
+            provider = "openai"
+            model = "broken-classifier-model"
+
+        class FakeLLMClient:
+            settings = FakeSettings()
+            is_configured = True
+
+            def complete_json(self, system_prompt: str, user_payload: dict[str, object]) -> dict[str, object]:
+                raise RuntimeError("classifier timeout")
+
+        with self.assertLogs("industrial_agent.app", level="WARNING") as logs:
+            result = classify_item(
+                {
+                    "title": "OpenAI Agent platform release",
+                    "raw_content": "OpenAI released an enterprise Agent platform for AI applications.",
+                    "source_type": "company",
+                },
+                llm_client=FakeLLMClient(),
+            )
+
+        self.assertEqual(result.llm_provider, "rules+structured-output")
+        self.assertIn("classifier_llm_failed", "\n".join(logs.output))
+        self.assertIn("classifier timeout", "\n".join(logs.output))
+
     def test_invalid_llm_label_is_rejected_instead_of_silently_saved(self) -> None:
         with self.assertRaises(ClassificationError):
             classify_item(
@@ -279,6 +306,37 @@ class RelevanceScreenContractTest(unittest.TestCase):
         self.assertIn("证据", fake_client.system_prompt)
         self.assertIn("不要编造", fake_client.system_prompt)
         self.assertIn("只判断是否进入", fake_client.system_prompt)
+
+    def test_relevance_logs_when_llm_call_fails_and_rules_fallback_is_used(self) -> None:
+        from app.services.relevance import screen_relevance
+
+        class FakeSettings:
+            provider = "openai"
+            model = "broken-relevance-model"
+
+        class FakeLLMClient:
+            settings = FakeSettings()
+            is_configured = True
+
+            def complete_json(self, system_prompt: str, user_payload: dict[str, object]) -> dict[str, object]:
+                raise RuntimeError("relevance timeout")
+
+        with self.assertLogs("industrial_agent.app", level="WARNING") as logs:
+            result = screen_relevance(
+                {
+                    "title": "OpenAI Agent platform release",
+                    "raw_content": "OpenAI released an enterprise Agent platform for AI applications.",
+                    "source_name": "OpenAI Blog",
+                    "source_type": "company",
+                    "url": "https://example.com/openai/agent-platform",
+                },
+                llm_client=FakeLLMClient(),
+            )
+
+        self.assertTrue(result.is_relevant)
+        self.assertEqual(result.provider, "rules-fallback")
+        self.assertIn("relevance_llm_failed", "\n".join(logs.output))
+        self.assertIn("relevance timeout", "\n".join(logs.output))
 
     def test_rejects_fake_degree_fraud_even_when_source_hint_is_nev(self) -> None:
         from app.services.relevance import screen_relevance
@@ -611,6 +669,29 @@ class RawItemNormalizationTest(unittest.TestCase):
             )
 
         self.assertEqual(items, [])
+
+    def test_html_collection_logs_article_page_fetch_failure(self) -> None:
+        html = """
+        <html><body>
+        <a href="/news/20260605-ai-chip-capacity.html">AI chip capacity expansion article one</a>
+        </body></html>
+        """
+
+        def article_fetcher(url: str) -> str:
+            raise RuntimeError("article page timeout")
+
+        with self.assertLogs("industrial_agent.app", level="WARNING") as logs:
+            items = extract_source_items(
+                {"id": 1, "name": "test source"},
+                html,
+                "https://example.com/",
+                limit=1,
+                article_fetcher=article_fetcher,
+            )
+
+        self.assertEqual(items, [])
+        self.assertIn("article_fetch_failed", "\n".join(logs.output))
+        self.assertIn("article page timeout", "\n".join(logs.output))
 
     def test_raw_item_preserves_full_article_and_derives_excerpt(self) -> None:
         content = "第一段说明政策背景。" * 40 + "最后一段包含产业影响。"
@@ -1541,13 +1622,16 @@ class RawItemNormalizationTest(unittest.TestCase):
             "published_at": "2026-06-05T09:00:00+00:00",
         }
 
-        result = extract_intelligence(item, classification, llm_client=FakeLLMClient())
+        with self.assertLogs("industrial_agent.app", level="WARNING") as logs:
+            result = extract_intelligence(item, classification, llm_client=FakeLLMClient())
 
         self.assertEqual(result.mode, "rules_fallback")
         self.assertIn("invalid", result.fallback_reason)
         self.assertIn("Microsoft explains frontier transformation", result.summary)
         self.assertEqual(result.provider, "rules+extractor")
         self.assertEqual(result.model, "local-rules")
+        self.assertIn("extractor_llm_failed", "\n".join(logs.output))
+        self.assertIn("missing or empty summary", "\n".join(logs.output))
 
     def test_html_collection_fetches_every_valid_article_page(self) -> None:
         html = """
@@ -1622,6 +1706,39 @@ class RawItemNormalizationTest(unittest.TestCase):
                 "https://example.com/news/inside-two.html",
             ],
         )
+
+    def test_html_collection_keeps_substantive_article_with_unknown_date_inside_window(self) -> None:
+        html = """
+        <html><body>
+        <a href="/article/agent-platform-release">AI agent platform release article</a>
+        </body></html>
+        """
+
+        def article_fetcher(url: str) -> str:
+            return """
+            <html>
+              <head><title>AI agent platform release article</title></head>
+              <body>
+                OpenAI released an enterprise agent platform with orchestration,
+                governance, data security, and deployment controls for industrial AI teams.
+              </body>
+            </html>
+            """
+
+        items = extract_source_items(
+            {"id": 1, "name": "test source"},
+            html,
+            "https://example.com/",
+            limit=10,
+            article_fetcher=article_fetcher,
+            published_after=datetime(2026, 6, 5, 0, 0, tzinfo=timezone.utc),
+            published_before=datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["url"], "https://example.com/article/agent-platform-release")
+        self.assertIsNone(items[0]["published_at"])
+        self.assertIn("enterprise agent platform", items[0]["raw_content"])
 
     def test_html_collection_ignores_navigation_and_column_links(self) -> None:
         html = """
@@ -1748,6 +1865,108 @@ class BriefGenerationContractTest(unittest.TestCase):
 
 
 class IntelligenceApiContractTest(unittest.TestCase):
+    def test_sources_api_creates_source_from_configuration_page(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+            app = FastAPI()
+            app.include_router(create_router(db))
+            client = TestClient(app)
+
+            response = client.post(
+                "/api/sources",
+                json={
+                    "name": "测试新闻源",
+                    "type": "media",
+                    "url": "https://example.com/news",
+                    "industry_hint": "ai",
+                    "reliability_score": 0.72,
+                    "enabled": True,
+                    "fetch_interval_minutes": 45,
+                },
+            )
+
+            self.assertEqual(response.status_code, 201)
+            source = response.json()
+            self.assertEqual(source["name"], "测试新闻源")
+            self.assertEqual(source["url"], "https://example.com/news")
+            self.assertEqual(source["reliability_score"], 0.72)
+            stored = db.query_one("SELECT * FROM sources WHERE id = ?", (source["id"],))
+            self.assertEqual(stored["fetch_interval_minutes"], 45)
+
+    def test_sources_api_updates_only_submitted_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+            source_id = db.execute(
+                """
+                INSERT INTO sources (name, type, url, industry_hint, reliability_score, enabled, fetch_interval_minutes)
+                VALUES ('原始源', 'company', 'https://example.com/blog', 'ai', 0.8, 1, 60)
+                """
+            )
+            app = FastAPI()
+            app.include_router(create_router(db))
+            client = TestClient(app)
+
+            response = client.patch(
+                f"/api/sources/{source_id}",
+                json={"name": "更新后的源", "enabled": False, "fetch_interval_minutes": 90},
+            )
+
+            self.assertEqual(response.status_code, 200)
+            source = response.json()
+            self.assertEqual(source["name"], "更新后的源")
+            self.assertEqual(source["url"], "https://example.com/blog")
+            self.assertFalse(source["enabled"])
+            self.assertEqual(source["fetch_interval_minutes"], 90)
+
+    def test_sources_api_deletes_unreferenced_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+            source_id = db.execute(
+                """
+                INSERT INTO sources (name, type, url, reliability_score)
+                VALUES ('临时源', 'media', 'https://temporary.example.com', 0.6)
+                """
+            )
+            app = FastAPI()
+            app.include_router(create_router(db))
+            client = TestClient(app)
+
+            response = client.delete(f"/api/sources/{source_id}")
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json(), {"deleted": source_id})
+            self.assertIsNone(db.query_one("SELECT * FROM sources WHERE id = ?", (source_id,)))
+
+    def test_sources_api_rejects_delete_when_source_has_raw_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+            source_id = db.execute(
+                """
+                INSERT INTO sources (name, type, url, reliability_score)
+                VALUES ('已有采集源', 'media', 'https://history.example.com', 0.6)
+                """
+            )
+            db.execute(
+                """
+                INSERT INTO raw_items (source_id, url, title, fetched_at, status)
+                VALUES (?, 'https://history.example.com/item', '历史采集记录', '2026-06-05T08:00:00+00:00', 'new')
+                """,
+                (source_id,),
+            )
+            app = FastAPI()
+            app.include_router(create_router(db))
+            client = TestClient(app)
+
+            response = client.delete(f"/api/sources/{source_id}")
+
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("已有采集记录", response.json()["detail"])
+            self.assertIsNotNone(db.query_one("SELECT * FROM sources WHERE id = ?", (source_id,)))
+
     def test_industry_subtag_filter_returns_only_items_with_that_tag(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / "agent.sqlite3")
@@ -1800,6 +2019,35 @@ class IntelligenceApiContractTest(unittest.TestCase):
 
             self.assertEqual(response.status_code, 200)
             self.assertEqual(len(response.json()), 2)
+
+    def test_runs_endpoint_returns_paginated_metadata_and_items(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+            base = datetime(2026, 6, 5, 8, 0, tzinfo=timezone.utc)
+            for index in range(35):
+                started_at = (base + timedelta(minutes=index)).isoformat()
+                db.execute(
+                    """
+                    INSERT INTO workflow_runs (trigger_type, started_at, ended_at, status, node_trace_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    ("source_interval_scan", started_at, started_at, "success", '[{"node":"collect"}]'),
+                )
+
+            app = FastAPI()
+            app.include_router(create_router(db))
+            client = TestClient(app)
+            response = client.get("/api/runs", params={"page": 2, "page_size": 10})
+
+            self.assertEqual(response.status_code, 200)
+            payload = response.json()
+            self.assertEqual(payload["page"], 2)
+            self.assertEqual(payload["page_size"], 10)
+            self.assertEqual(payload["total"], 35)
+            self.assertEqual(len(payload["items"]), 10)
+            self.assertEqual([run["id"] for run in payload["items"]], list(range(25, 15, -1)))
+            self.assertEqual(payload["items"][0]["node_trace"], [{"node": "collect"}])
 
     def test_item_detail_returns_item_scoped_processing_trace(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1885,6 +2133,72 @@ class WorkflowTraceContractTest(unittest.TestCase):
 
 
 class RealSourceCollectionContractTest(unittest.TestCase):
+    def test_logging_config_writes_runtime_and_scheduler_logs_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from app.logging_config import APP_LOGGER_NAME, SCHEDULER_LOGGER_NAME, close_configured_logging, configure_logging
+
+            log_dir = Path(tmp) / "log"
+            try:
+                configure_logging(log_dir)
+                app_logger = __import__("logging").getLogger(APP_LOGGER_NAME)
+                scheduler_logger = __import__("logging").getLogger(SCHEDULER_LOGGER_NAME)
+                app_handler_count = len([handler for handler in app_logger.handlers if getattr(handler, "baseFilename", "").endswith("app.log")])
+
+                app_logger.info("runtime visibility marker")
+                scheduler_logger.info("scheduled visibility marker")
+                configure_logging(log_dir)
+
+                for logger in (app_logger, scheduler_logger):
+                    for handler in logger.handlers:
+                        handler.flush()
+
+                self.assertEqual(
+                    len([handler for handler in app_logger.handlers if getattr(handler, "baseFilename", "").endswith("app.log")]),
+                    app_handler_count,
+                )
+                self.assertTrue((log_dir / "app.log").exists())
+                self.assertTrue((log_dir / "scheduler.log").exists())
+                self.assertIn("runtime visibility marker", (log_dir / "app.log").read_text(encoding="utf-8"))
+                self.assertNotIn("scheduled visibility marker", (log_dir / "app.log").read_text(encoding="utf-8"))
+                self.assertIn("scheduled visibility marker", (log_dir / "scheduler.log").read_text(encoding="utf-8"))
+                self.assertNotIn("runtime visibility marker", (log_dir / "scheduler.log").read_text(encoding="utf-8"))
+            finally:
+                close_configured_logging()
+
+    def test_scheduler_logged_job_records_start_finish_and_exceptions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            from app.logging_config import close_configured_logging, configure_logging
+            from app.scheduler import _run_logged_job
+
+            log_dir = Path(tmp) / "log"
+            try:
+                configure_logging(log_dir)
+
+                result = _run_logged_job(
+                    "test_collect",
+                    lambda: {"id": 7, "status": "success", "collected_count": 3, "failed_count": 0},
+                    trigger_type="scheduled_monitor",
+                    force_all=True,
+                )
+                with self.assertRaises(RuntimeError):
+                    _run_logged_job("test_failure", lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+
+                self.assertEqual(result["id"], 7)
+                content = (log_dir / "scheduler.log").read_text(encoding="utf-8")
+                self.assertIn("job_start job_id=test_collect trigger_type=scheduled_monitor force_all=True", content)
+                self.assertIn("job_finish job_id=test_collect", content)
+                self.assertIn("run_id=7 status=success collected=3 failed=0", content)
+                self.assertIn("job_error job_id=test_failure", content)
+                self.assertIn("boom", content)
+            finally:
+                close_configured_logging()
+
+    def test_python_module_entrypoint_does_not_reimport_app_main(self) -> None:
+        main_source = (Path(__file__).resolve().parents[1] / "app" / "main.py").read_text(encoding="utf-8")
+
+        self.assertIn("uvicorn.run(app,", main_source)
+        self.assertNotIn('"app.main:app"', main_source)
+
     def test_source_interval_scan_runs_through_langgraph_orchestrator(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / "agent.sqlite3")
@@ -2133,6 +2447,30 @@ class RealSourceCollectionContractTest(unittest.TestCase):
                 ],
             )
 
+    def test_empty_source_interval_scan_does_not_advance_last_successful_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+            workflow.ensure_sources(db)
+            last_fetched_at = "2026-06-05T07:30:00+00:00"
+            now = datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc)
+            db.execute(
+                "UPDATE sources SET last_fetched_at = ?, last_checked_at = NULL, last_error = ? WHERE id = 1",
+                (last_fetched_at, "previous transient error"),
+            )
+
+            workflow.run_source_interval_scan(
+                db,
+                now=now,
+                fetcher=lambda source: [],
+                force_all=True,
+            )
+
+            source = db.query_one("SELECT * FROM sources WHERE id = ?", (1,))
+            self.assertEqual(source["last_fetched_at"], last_fetched_at)
+            self.assertEqual(source["last_checked_at"], now.isoformat())
+            self.assertIsNone(source["last_error"])
+
     def test_scheduler_registers_source_interval_scan_job(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db = Database(Path(tmp) / "agent.sqlite3")
@@ -2145,6 +2483,39 @@ class RealSourceCollectionContractTest(unittest.TestCase):
                 scheduler.shutdown(wait=False)
 
             self.assertIn("source_interval_scan", job_ids)
+
+    def test_scheduler_reuses_existing_instance_for_same_database_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+
+            first = start_scheduler(db, enabled=True)
+            second = start_scheduler(Database(db.path), enabled=True)
+            try:
+                self.assertIs(second, first)
+            finally:
+                first.shutdown(wait=False)
+
+    def test_scheduler_does_not_start_when_another_process_holds_active_lease(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+            now = datetime.now(timezone.utc)
+            db.execute(
+                """
+                INSERT INTO scheduler_locks (name, owner_id, acquired_at, heartbeat_at, expires_at)
+                VALUES ('main', 'other-process', ?, ?, ?)
+                """,
+                (
+                    now.isoformat(),
+                    now.isoformat(),
+                    (now + timedelta(minutes=5)).isoformat(),
+                ),
+            )
+
+            scheduler = start_scheduler(db, enabled=True)
+
+            self.assertIsNone(scheduler)
 
     def test_source_interval_scan_skips_when_another_workflow_is_running(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2168,6 +2539,58 @@ class RealSourceCollectionContractTest(unittest.TestCase):
 
             self.assertEqual(run["status"], "skipped")
             self.assertEqual(fetch_calls, 0)
+            self.assertIn("already running", run["error_summary"])
+
+    def test_database_allows_only_one_running_workflow(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+            db.execute(
+                """
+                INSERT INTO workflow_runs (trigger_type, started_at, status, node_trace_json)
+                VALUES ('scheduled_monitor', '2026-06-05T09:00:00+00:00', 'running', '[]')
+                """
+            )
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.execute(
+                    """
+                    INSERT INTO workflow_runs (trigger_type, started_at, status, node_trace_json)
+                    VALUES ('high_authority_monitor', '2026-06-05T09:00:00+00:00', 'running', '[]')
+                    """
+                )
+
+    def test_source_interval_scan_reports_skipped_when_running_insert_loses_database_race(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db = Database(Path(tmp) / "agent.sqlite3")
+            db.init()
+            workflow.ensure_sources(db)
+            db.execute(
+                """
+                INSERT INTO workflow_runs (trigger_type, started_at, status, node_trace_json)
+                VALUES ('scheduled_monitor', '2026-06-05T09:00:00+00:00', 'running', '[]')
+                """
+            )
+
+            original_query_one = Database.query_one
+            query_calls = 0
+
+            def query_one_with_initial_race(sql: str, params: tuple[object, ...] = ()) -> dict[str, object] | None:
+                nonlocal query_calls
+                query_calls += 1
+                if query_calls == 1 and "WHERE status = 'running'" in sql:
+                    return None
+                return original_query_one(db, sql, params)
+
+            with patch("app.services.workflow.Database.query_one", side_effect=query_one_with_initial_race):
+                run = workflow.run_source_interval_scan(
+                    db,
+                    now=datetime(2026, 6, 5, 9, 0, tzinfo=timezone.utc),
+                    fetcher=lambda source: [],
+                    force_all=True,
+                )
+
+            self.assertEqual(run["status"], "skipped")
             self.assertIn("already running", run["error_summary"])
 
     def test_startup_recovery_marks_interrupted_running_workflows_failed(self) -> None:

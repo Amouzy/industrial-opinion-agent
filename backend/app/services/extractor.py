@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from html import unescape
 from typing import Any
 
+from app.logging_config import APP_LOGGER_NAME
 from app.services.collector import clean_article_text, compact_text
 from app.services.llm import LLMClient
+
+
+logger = logging.getLogger(APP_LOGGER_NAME)
 
 
 class ExtractionError(ValueError):
@@ -35,6 +40,16 @@ def extract_intelligence(
             payload = _extract_with_llm(item, classification, llm_client)
             return _result_from_llm_payload(item, classification, payload, llm_client)
         except Exception as exc:
+            logger.warning(
+                "extractor_llm_failed source_id=%s title=%r url=%s provider=%s model=%s error=%s",
+                item.get("source_id"),
+                item.get("title"),
+                item.get("url"),
+                getattr(llm_client.settings, "provider", "unknown"),
+                getattr(llm_client.settings, "model", "unknown"),
+                exc,
+                exc_info=True,
+            )
             return _fallback_result(item, classification, f"invalid_llm_payload: {exc}")
     return _fallback_result(item, classification, "llm_unconfigured")
 

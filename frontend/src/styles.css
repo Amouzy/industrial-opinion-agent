@@ -978,6 +978,44 @@ a {
   gap: 10px;
 }
 
+.run-pagination {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.run-page-button {
+  min-height: 34px;
+  border: 1px solid rgba(15, 107, 79, 0.18);
+  border-radius: 999px;
+  padding: 7px 11px;
+  background: rgba(15, 107, 79, 0.08);
+  color: var(--green);
+  font-size: 12px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.run-page-button:disabled {
+  cursor: not-allowed;
+  border-color: rgba(16, 32, 29, 0.08);
+  background: rgba(16, 32, 29, 0.04);
+  color: var(--muted);
+}
+
+.run-page-status {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+  text-align: center;
+  white-space: nowrap;
+}
+
 .run-row {
   display: grid;
   width: 100%;
@@ -1081,6 +1119,88 @@ a {
   margin: 0 0 16px;
 }
 
+.source-page-head {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.source-page-head h2 {
+  margin: 0;
+}
+
+.source-form {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  align-items: end;
+  margin-bottom: 18px;
+  padding: 16px;
+  border: 1px solid var(--line);
+  border-radius: 20px;
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.source-form-title {
+  display: grid;
+  gap: 2px;
+  align-self: center;
+}
+
+.source-form-title strong {
+  font-size: 16px;
+}
+
+.source-form-title span,
+.source-form label span {
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+}
+
+.source-form label {
+  display: grid;
+  gap: 7px;
+}
+
+.source-form-wide {
+  grid-column: span 2;
+}
+
+.source-form-priority {
+  grid-column: span 1;
+}
+
+.source-toggle {
+  display: inline-flex !important;
+  grid-auto-flow: column;
+  grid-auto-columns: max-content;
+  gap: 8px !important;
+  align-items: center;
+  min-height: 40px;
+  padding: 8px 0;
+}
+
+.source-toggle input {
+  width: 18px;
+  height: 18px;
+  accent-color: var(--green);
+}
+
+.source-form-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.source-form-actions .primary,
+.source-form-actions .secondary {
+  min-width: 112px;
+}
+
 .brief-card,
 .source-card,
 .taxonomy-grid article {
@@ -1116,6 +1236,87 @@ a {
   display: grid;
   gap: 8px;
   overflow-wrap: anywhere;
+}
+
+.source-card-head,
+.source-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+  align-items: center;
+}
+
+.source-switch {
+  display: inline-grid;
+  grid-template-columns: 32px auto;
+  align-items: center;
+  gap: 7px;
+  min-height: 30px;
+  border: 1px solid rgba(16, 32, 29, 0.12);
+  border-radius: 999px;
+  padding: 4px 9px 4px 5px;
+  background: rgba(16, 32, 29, 0.06);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.source-switch.active {
+  border-color: rgba(15, 107, 79, 0.2);
+  background: rgba(15, 107, 79, 0.1);
+  color: var(--green);
+}
+
+.source-switch:disabled {
+  cursor: not-allowed;
+  opacity: 0.68;
+}
+
+.source-switch-thumb {
+  position: relative;
+  display: block;
+  width: 32px;
+  height: 18px;
+  border-radius: 999px;
+  background: rgba(16, 32, 29, 0.2);
+  transition: background 0.18s ease;
+}
+
+.source-switch-thumb::after {
+  content: "";
+  position: absolute;
+  top: 3px;
+  left: 3px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 2px 6px rgba(16, 32, 29, 0.22);
+  transition: transform 0.18s ease;
+}
+
+.source-switch.active .source-switch-thumb {
+  background: var(--green);
+}
+
+.source-switch.active .source-switch-thumb::after {
+  transform: translateX(14px);
+}
+
+.source-card-actions {
+  justify-content: flex-start;
+  padding-top: 4px;
+}
+
+.text-button.danger {
+  color: var(--red);
+}
+
+.text-button:disabled {
+  cursor: not-allowed;
+  color: var(--muted);
 }
 
 .taxonomy-grid article {
@@ -1168,8 +1369,13 @@ a {
 
   .topbar,
   .summary-strip,
-  .workbench {
+  .workbench,
+  .source-form {
     grid-template-columns: 1fr;
+  }
+
+  .source-form-wide {
+    grid-column: auto;
   }
 
   .top-actions {
@@ -1203,6 +1409,10 @@ a {
 
   .runs-layout,
   .trace-io-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .run-pagination {
     grid-template-columns: 1fr;
   }
 }

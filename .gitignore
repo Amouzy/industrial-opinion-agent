@@ -12,6 +12,7 @@ frontend/dist/
 frontend/log/*
 !frontend/log/.gitkeep
 docs/*
+!docs/DATABASE_DESIGN.md
 !docs/desc/
 !docs/desc/**
 .env

@@ -121,6 +121,14 @@ CREATE TABLE IF NOT EXISTS workflow_runs (
     node_trace_json TEXT
 );
 
+CREATE TABLE IF NOT EXISTS scheduler_locks (
+    name TEXT PRIMARY KEY,
+    owner_id TEXT NOT NULL,
+    acquired_at TEXT NOT NULL,
+    heartbeat_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sources_type ON sources(type);
 CREATE INDEX IF NOT EXISTS idx_raw_items_content_hash ON raw_items(content_hash);
 CREATE INDEX IF NOT EXISTS idx_raw_items_published_at ON raw_items(published_at);
@@ -156,6 +164,25 @@ class Database:
         source_columns = {row["name"] for row in conn.execute("PRAGMA table_info(sources)").fetchall()}
         if "last_checked_at" not in source_columns:
             conn.execute("ALTER TABLE sources ADD COLUMN last_checked_at TEXT")
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS scheduler_locks (
+                name TEXT PRIMARY KEY,
+                owner_id TEXT NOT NULL,
+                acquired_at TEXT NOT NULL,
+                heartbeat_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL
+            )
+            """
+        )
+        self._deduplicate_running_workflows(conn)
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_workflow_runs_one_running
+            ON workflow_runs(status)
+            WHERE status = 'running'
+            """
+        )
         raw_item_columns = {row["name"] for row in conn.execute("PRAGMA table_info(raw_items)").fetchall()}
         for column_name, column_type in [
             ("relevance_industry", "TEXT"),
@@ -176,6 +203,27 @@ class Database:
         ]:
             if column_name not in processed_item_columns:
                 conn.execute(f"ALTER TABLE processed_items ADD COLUMN {column_name} {column_type}")
+
+    def _deduplicate_running_workflows(self, conn: sqlite3.Connection) -> None:
+        running = conn.execute(
+            "SELECT id FROM workflow_runs WHERE status = 'running' ORDER BY started_at DESC, id DESC"
+        ).fetchall()
+        if len(running) <= 1:
+            return
+        keep_id = running[0]["id"]
+        duplicate_ids = [row["id"] for row in running[1:]]
+        placeholders = ",".join("?" for _ in duplicate_ids)
+        conn.execute(
+            f"""
+            UPDATE workflow_runs
+            SET ended_at = COALESCE(ended_at, started_at),
+                status = 'failed',
+                failed_count = failed_count + 1,
+                error_summary = COALESCE(error_summary || ' | ', '') || 'Duplicate running workflow closed during migration'
+            WHERE id IN ({placeholders}) AND id != ?
+            """,
+            (*duplicate_ids, keep_id),
+        )
 
     def query(self, sql: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
         with self.connect() as conn:

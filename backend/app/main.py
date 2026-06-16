@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+
 try:
     import uvicorn
     from fastapi import FastAPI
@@ -10,16 +12,27 @@ except ImportError as exc:  # pragma: no cover - shown when dependencies are mis
 from app.api import create_router
 from app.config import get_settings
 from app.database import Database
+from app.logging_config import APP_LOGGER_NAME, configure_logging
 from app.scheduler import start_scheduler
 from app.services.workflow import ensure_seed_data, recover_interrupted_runs
 
 
 settings = get_settings()
+configure_logging()
+logger = logging.getLogger(APP_LOGGER_NAME)
 db = Database(settings.database_path)
 db.init()
-recover_interrupted_runs(db)
+recovered_runs = recover_interrupted_runs(db)
+if recovered_runs:
+    logger.warning("startup_recovered_interrupted_runs count=%s", recovered_runs)
 if settings.seed_on_start:
     ensure_seed_data(db)
+logger.info(
+    "app_startup database=%s scheduler_enabled=%s timezone=%s",
+    settings.database_path,
+    settings.scheduler_enabled,
+    settings.app_timezone,
+)
 
 app = FastAPI(title="Industrial Opinion Agent V2", version="0.2.0")
 app.add_middleware(
@@ -39,4 +52,4 @@ def health() -> dict[str, object]:
 
 
 if __name__ == "__main__":
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=False)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=False)
